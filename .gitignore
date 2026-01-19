@@ -205,3 +205,11 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Configuration files with sensitive data
+config_hyperliquid.json
+config_hyperliquid_*.json
+*_config.json
+.env
+# Reports
+reports
