@@ -213,3 +213,5 @@ config_hyperliquid_*.json
 .env
 # Reports
 reports
+# PNL history
+pnl_history.csv
