@@ -83,9 +83,9 @@ def test_funding_analysis_with_prices():
     print("✓ All expected columns present")
     
     # Verify calculated_funding is computed correctly
-    print("\nVerifying calculated funding formula (price * |size| * rate):")
+    print("\nVerifying calculated funding formula (-1 * size * price * rate):")
     for idx, row in result.iterrows():
-        expected_calc = row['token_price'] * abs(row['position_size']) * row['funding_rate']
+        expected_calc = -1 * row['position_size'] * row['token_price'] * row['funding_rate']
         actual_calc = row['calculated_funding']
         
         print(f"  {row['coin']}: price={row['token_price']:.2f}, "

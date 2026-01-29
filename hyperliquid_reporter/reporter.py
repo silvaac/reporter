@@ -297,7 +297,7 @@ class HyperliquidReporter(BaseReporter):
             - position_size: Position size at time of funding
             - funding_rate: The funding rate applied
             - token_price: Token price at funding time (matched by datetime)
-            - calculated_funding: Calculated funding (price * size * funding_rate)
+            - calculated_funding: Calculated funding (-1 * size * price * funding_rate)
         
         Raises:
             ReportGenerationError: If unable to generate funding analysis.
@@ -328,10 +328,11 @@ class HyperliquidReporter(BaseReporter):
             # Add token prices matched by datetime
             result_df = self._add_token_prices_to_funding(result_df)
             
-            # Calculate funding: price * size * funding_rate
+            # Calculate funding: -1 * size * price * funding_rate (keep all signs)
             result_df["calculated_funding"] = (
+                -1 * 
+                result_df["position_size"] * 
                 result_df["token_price"] * 
-                result_df["position_size"].abs() * 
                 result_df["funding_rate"]
             )
             
