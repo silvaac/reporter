@@ -23,11 +23,16 @@ A comprehensive Python package for generating professional trading performance r
 - **📊 AUM Tracking**: Monitor Assets Under Management over time with detailed historical data
 - **💹 Performance Analysis**: Track P&L in both USD and percentage with cumulative metrics
 - **🔄 Trade Analysis**: Detailed breakdown of all trades including costs, fees, and net P&L
-- **💸 Funding Costs**: Comprehensive tracking of funding payments for perpetual positions
+- **💸 Funding Costs**: Comprehensive tracking of funding payments with:
+  - Token price matching at funding time (UTC-aware)
+  - Calculated funding verification (price × size × rate)
+  - Cumulative funding costs chart
+  - Cumulative funding rate chart (in basis points)
+  - Local caching for efficient price data retrieval
 - **📈 Visualizations**: Professional charts and graphs using matplotlib
 - **📧 Email Reports**: Automated HTML email delivery with embedded visualizations
 - **🎯 Spot & Perpetuals**: Full support for both spot and perpetual trading accounts
-- **✅ Unit Tests**: 38 comprehensive tests covering all core functionality
+- **✅ Unit Tests**: 42 comprehensive tests covering all core functionality
 
 ## Installation
 
@@ -239,9 +244,17 @@ with open("report.html", "w") as f:
 ### Funding Costs
 - Total funding paid/received
 - Average funding payment
-- Cumulative funding chart over time
+- Cumulative funding costs chart (USD over time)
+- Cumulative funding rate chart (basis points over time)
 - Funding by coin breakdown
-- Funding history table
+- Detailed funding history table with:
+  - Date (UTC and EST)
+  - Coin symbol
+  - Funding payment (actual from exchange)
+  - Position size at funding time
+  - Funding rate in basis points
+  - Token price at funding time (matched via UTC timestamps)
+  - Calculated funding (price × |size| × rate for verification)
 
 ## API Reference
 
@@ -308,7 +321,8 @@ funding_analysis = reporter.generate_funding_analysis(
     end_time=None,
     lookback_days=30
 )
-# Returns: DataFrame with coin, funding_payment, position_size, funding_rate
+# Returns: DataFrame with coin, funding_payment, position_size, funding_rate,
+#          token_price, calculated_funding
 
 # Generate complete report
 report_data = reporter.generate_report_data(
@@ -336,7 +350,7 @@ html = reporter.generate_html_report(
 
 ## Testing
 
-The package includes a comprehensive unit test suite with 38 tests covering all core functionality.
+The package includes a comprehensive unit test suite with 42 tests covering all core functionality.
 
 ### Running Tests
 
@@ -361,13 +375,18 @@ pytest --cov=. --cov-report=html --cov-report=term
 
 ```
 tests/
-├── test_exceptions.py          # 8 tests for exception classes
-├── test_base_monitoring.py     # 8 tests for base monitoring
-├── test_base_reporter.py       # 3 tests for base reporter
-├── test_config.py              # 13 tests for configuration
-├── test_hyperliquid_reporter.py # 9 tests for reporter implementation
-├── conftest.py                 # Shared fixtures
-└── README.md                   # Testing documentation
+├── test_exceptions.py              # 8 tests for exception classes
+├── test_base_monitoring.py         # 8 tests for base monitoring
+├── test_base_reporter.py           # 3 tests for base reporter
+├── test_config.py                  # 13 tests for configuration
+├── test_hyperliquid_reporter.py    # 9 tests for reporter implementation
+├── test_funding_enhancements.py    # 1 test for funding enhancements
+├── test_cumulative_rate_chart.py   # Cumulative rate chart verification
+├── test_funding_timezone.py        # Timezone handling verification
+├── test_price_matching.py          # Price matching verification
+├── debug_price_data.py             # Price data structure debugging
+├── conftest.py                     # Shared fixtures
+└── README.md                       # Testing documentation
 ```
 
 ### Test Coverage
@@ -378,6 +397,9 @@ tests/
 - ✅ Reporter data generation (AUM, performance, trades, funding)
 - ✅ Summary statistics calculation
 - ✅ Visualization creation
+- ✅ Funding enhancements (token prices, calculated funding)
+- ✅ Price matching with UTC timezone handling
+- ✅ Cumulative funding rate chart generation
 
 ### Testing Workflow
 
@@ -574,6 +596,24 @@ pip install pytest pytest-cov pytest-mock
 pip install -r requirements.txt
 ```
 
+### Funding Analysis Issues
+
+**Issue: Token prices showing as $0.00**
+- **Cause**: Price data not available in cache or API issues
+- **Solution**: First run downloads and caches price data. Check `./data/hyperliquid/perp/` directory is created with write permissions. Subsequent runs will be faster.
+
+**Issue: Calculated funding doesn't match reported funding**
+- **Cause**: Exchange may use different price source (mark price vs last price)
+- **Solution**: This is expected. Small differences are normal. The calculated funding uses close price from hourly candles for verification purposes.
+
+**Issue: Incorrect timestamps in funding table**
+- **Cause**: Timezone confusion between UTC and local time
+- **Solution**: All funding data is in UTC. The report displays both UTC and EST (UTC-5) columns. Verify your system time is correct.
+
+**Issue: Price matching rate below 100%**
+- **Cause**: Price data may not cover the full funding history period
+- **Solution**: Price data is cached starting from the first download. Historical data before the cache was created may not have prices. This is normal for older funding entries.
+
 ## Security
 
 ### Best Practices
@@ -659,7 +699,16 @@ For issues, questions, or contributions:
 
 ## Changelog
 
-### Version 1.0.0 (Current)
+### Version 1.1.0 (Current)
+- ✅ Enhanced funding analysis with token price matching
+- ✅ Calculated funding verification (price × size × rate)
+- ✅ Cumulative funding rate chart (basis points)
+- ✅ UTC timezone-aware price matching
+- ✅ Local price data caching for performance
+- ✅ 42 comprehensive unit tests
+- ✅ Improved error handling and logging
+
+### Version 1.0.0
 - ✅ Initial release
 - ✅ Full Hyperliquid support
 - ✅ AUM tracking with visualizations
@@ -670,7 +719,6 @@ For issues, questions, or contributions:
 - ✅ HTML report generation
 - ✅ Email delivery via Mailgun
 - ✅ Jupyter notebook examples
-- ✅ 38 comprehensive unit tests
 - ✅ Professional documentation
 
 ---

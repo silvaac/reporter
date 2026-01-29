@@ -296,6 +296,8 @@ class HyperliquidReporter(BaseReporter):
             - funding_payment: USD value (positive = received, negative = paid)
             - position_size: Position size at time of funding
             - funding_rate: The funding rate applied
+            - token_price: Token price at funding time (matched by datetime)
+            - calculated_funding: Calculated funding (price * size * funding_rate)
         
         Raises:
             ReportGenerationError: If unable to generate funding analysis.
@@ -311,7 +313,8 @@ class HyperliquidReporter(BaseReporter):
             if funding_df.empty:
                 logger.warning("No funding data available")
                 return pd.DataFrame(columns=[
-                    "coin", "funding_payment", "position_size", "funding_rate"
+                    "coin", "funding_payment", "position_size", "funding_rate",
+                    "token_price", "calculated_funding"
                 ])
             
             result_df = pd.DataFrame()
@@ -321,6 +324,16 @@ class HyperliquidReporter(BaseReporter):
             result_df["funding_rate"] = funding_df["fundingRate"].astype(float)
             
             result_df.index = funding_df.index
+            
+            # Add token prices matched by datetime
+            result_df = self._add_token_prices_to_funding(result_df)
+            
+            # Calculate funding: price * size * funding_rate
+            result_df["calculated_funding"] = (
+                result_df["token_price"] * 
+                result_df["position_size"].abs() * 
+                result_df["funding_rate"]
+            )
             
             return result_df
         except Exception as e:
@@ -396,6 +409,138 @@ class HyperliquidReporter(BaseReporter):
             }
         except Exception as e:
             raise ReportGenerationError(f"Failed to generate report data: {e}") from e
+    
+    def _add_token_prices_to_funding(self, funding_df: pd.DataFrame) -> pd.DataFrame:
+        """Add token prices to funding dataframe, matched by datetime.
+        
+        Uses token_data's HyperliquidPerpManager for price data with local caching.
+        
+        Args:
+            funding_df: DataFrame with funding data (must have 'coin' column and datetime index).
+        
+        Returns:
+            DataFrame with added 'token_price' column.
+        """
+        if funding_df.empty:
+            funding_df["token_price"] = 0.0
+            return funding_df
+        
+        try:
+            from token_data.hyperliquid import HyperliquidPerpManager
+            
+            # Get unique coins from funding data
+            unique_coins = funding_df["coin"].unique().tolist()
+            logger.info(f"Fetching price data for {len(unique_coins)} coins: {unique_coins}")
+            
+            # Initialize price column with NaN
+            funding_df["token_price"] = float('nan')
+            
+            # Ensure funding_df has UTC timezone-aware datetime index
+            if funding_df.index.tz is None:
+                funding_df.index = funding_df.index.tz_localize('UTC')
+            
+            # Get date range for price data (add buffer for matching)
+            min_date = funding_df.index.min()
+            max_date = funding_df.index.max()
+            
+            # Calculate refresh hours based on date range
+            date_range_hours = int((max_date - min_date).total_seconds() / 3600) + 48
+            
+            # Use HyperliquidPerpManager to fetch and cache price data
+            # This will automatically save to local files and reuse them
+            price_manager = HyperliquidPerpManager(
+                ticker=unique_coins,
+                data_dir="./data/hyperliquid",  # Local cache directory
+                interval="1h",  # 1-hour candles for matching
+                file_type="parquet",  # Use parquet for efficient storage
+                update=True,  # Update with new data
+                save=True,  # Save to local cache
+                refresh_hours=min(date_range_hours, 720),  # Limit to 30 days max per request
+                info=self.monitor._info,
+                verbose=False  # Reduce logging noise
+            )
+            
+            # Match prices to funding timestamps for each coin
+            for coin in unique_coins:
+                try:
+                    # Get price data for this coin
+                    price_data = price_manager.get_data(coin)
+                    
+                    if price_data is None or price_data.empty:
+                        logger.warning(f"No price data available for {coin}")
+                        continue
+                    
+                    # Check if price_data has a datetime column or datetime index
+                    if 'datetime' in price_data.columns:
+                        # If datetime is a column, set it as index
+                        price_df = price_data.set_index('datetime')[["close"]].copy()
+                    elif isinstance(price_data.index, pd.DatetimeIndex):
+                        # Already has datetime index
+                        price_df = price_data[["close"]].copy()
+                    else:
+                        logger.warning(f"Price data for {coin} has no datetime index or column")
+                        continue
+                    
+                    # Get funding entries for this coin
+                    coin_mask = funding_df["coin"] == coin
+                    
+                    # Ensure price dataframe has UTC timezone-aware datetime index
+                    if not isinstance(price_df.index, pd.DatetimeIndex):
+                        logger.warning(f"Price data for {coin} index is not DatetimeIndex")
+                        continue
+                        
+                    if price_df.index.tz is None:
+                        price_df.index = price_df.index.tz_localize('UTC')
+                    
+                    # Sort price dataframe by index
+                    price_df_sorted = price_df.sort_index()
+                    
+                    # Get funding timestamps for this coin (already sorted in funding_df)
+                    funding_times = funding_df[coin_mask].index
+                    
+                    logger.info(f"Price data for {coin}: {len(price_df_sorted)} candles from {price_df_sorted.index[0]} to {price_df_sorted.index[-1]}")
+                    logger.info(f"Funding data for {coin}: {len(funding_times)} entries from {funding_times[0]} to {funding_times[-1]}")
+                    
+                    # For each funding timestamp, find the nearest price
+                    for funding_time in funding_times:
+                        # Find the closest price within tolerance
+                        time_diff = abs(price_df_sorted.index - funding_time)
+                        min_diff = time_diff.min()
+                        
+                        # Only match if within 2 hours tolerance
+                        if min_diff <= pd.Timedelta(hours=2):
+                            closest_idx = time_diff.argmin()
+                            price = price_df_sorted.iloc[closest_idx]["close"]
+                            funding_df.loc[funding_time, "token_price"] = float(price)
+                            logger.debug(f"Matched {coin} at {funding_time}: price={price:.2f}, diff={min_diff}")
+                    
+                    matched = (funding_df.loc[coin_mask, "token_price"] > 0).sum()
+                    logger.info(f"Matched prices for {coin}: {matched}/{coin_mask.sum()} funding entries")
+                    
+                except Exception as e:
+                    logger.warning(f"Failed to fetch/match price data for {coin}: {e}")
+                    import traceback
+                    logger.debug(traceback.format_exc())
+                    continue
+            
+            # Fill any remaining NaN values with 0.0
+            funding_df["token_price"] = funding_df["token_price"].fillna(0.0)
+            
+            # Log summary
+            matched_count = (funding_df["token_price"] > 0).sum()
+            total_count = len(funding_df)
+            logger.info(f"Price matching complete: {matched_count}/{total_count} entries matched")
+            
+            return funding_df
+            
+        except ImportError as e:
+            logger.warning(f"token_data not available for price data: {e}")
+            funding_df["token_price"] = 0.0
+            return funding_df
+        except Exception as e:
+            logger.error(f"Error adding token prices to funding data: {e}")
+            funding_df["token_price"] = 0.0
+            return funding_df
     
     def _calculate_summary_stats(
         self,
@@ -532,6 +677,10 @@ class HyperliquidReporter(BaseReporter):
             funding_by_coin_img = self._create_funding_by_coin_chart(report_data["funding_analysis"])
             if funding_by_coin_img:
                 visualizations["funding_by_coin_chart"] = funding_by_coin_img
+            
+            cumulative_rate_img = self._create_cumulative_funding_rate_chart(report_data["funding_analysis"])
+            if cumulative_rate_img:
+                visualizations["cumulative_funding_rate_chart"] = cumulative_rate_img
             
             trade_img = self._create_trade_distribution_chart(report_data["trade_analysis"])
             if trade_img:
@@ -752,6 +901,40 @@ class HyperliquidReporter(BaseReporter):
         ax.set_ylabel("Coin", fontsize=12)
         ax.grid(True, alpha=0.3, axis='x')
         
+        plt.tight_layout()
+        
+        return self._fig_to_base64(fig)
+    
+    def _create_cumulative_funding_rate_chart(self, funding_data: pd.DataFrame) -> Optional[str]:
+        """Create cumulative funding rate chart in basis points.
+        
+        Shows the cumulative sum of funding rates (in bps) over the account history.
+        
+        Args:
+            funding_data: Funding DataFrame with 'funding_rate' column.
+        
+        Returns:
+            Base64-encoded image string or None if no data.
+        """
+        if funding_data.empty or "funding_rate" not in funding_data.columns:
+            return None
+        
+        fig, ax = plt.subplots(1, 1, figsize=(12, 6))
+        
+        # Convert funding rate to basis points (multiply by 10000)
+        funding_rate_bps = funding_data["funding_rate"] * 10000
+        cumulative_rate_bps = funding_rate_bps.cumsum()
+        
+        ax.plot(funding_data.index, cumulative_rate_bps, linewidth=2, color="#E67E22")
+        ax.fill_between(funding_data.index, cumulative_rate_bps, alpha=0.3, color="#E67E22")
+        ax.axhline(y=0, color='black', linestyle='--', alpha=0.3)
+        ax.set_title("Cumulative Funding Rate Over Time", fontsize=14, fontweight="bold")
+        ax.set_ylabel("Cumulative Funding Rate (bps)", fontsize=12)
+        ax.set_xlabel("Date", fontsize=12)
+        ax.grid(True, alpha=0.3)
+        
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+        fig.autofmt_xdate()
         plt.tight_layout()
         
         return self._fig_to_base64(fig)
@@ -1269,6 +1452,13 @@ class HyperliquidReporter(BaseReporter):
         </div>
 """
             
+            if "cumulative_funding_rate_chart" in visualizations:
+                html += f"""
+        <div class="chart">
+            <img src="data:image/png;base64,{visualizations['cumulative_funding_rate_chart']}" alt="Cumulative Funding Rate Chart">
+        </div>
+"""
+            
             funding_by_coin = stats.get('funding_by_coin', {})
             if funding_by_coin:
                 html += """
@@ -1316,6 +1506,8 @@ class HyperliquidReporter(BaseReporter):
                         <th>Funding Payment (USD)</th>
                         <th>Position Size</th>
                         <th>Funding Rate (bps)</th>
+                        <th>Token Price (USD)</th>
+                        <th>Calculated Funding (USD)</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -1325,18 +1517,22 @@ class HyperliquidReporter(BaseReporter):
                 for idx, row in recent_funding.iterrows():
                     funding_class = "positive-value" if row["funding_payment"] >= 0 else "negative-value"
                     rate_class = "positive-value" if row["funding_rate"] >= 0 else "negative-value"
+                    calc_funding_class = "positive-value" if row.get("calculated_funding", 0) >= 0 else "negative-value"
                     
-                    # Convert EST to UTC (EST+5)
-                    utc_time = idx + pd.Timedelta(hours=5)
+                    # idx is already in UTC from token_data API
+                    # Convert UTC to EST (UTC-5)
+                    est_time = idx - pd.Timedelta(hours=5)
                     
                     html += f"""
                     <tr>
-                        <td>{utc_time.strftime('%Y-%m-%d %H:%M')}</td>
                         <td>{idx.strftime('%Y-%m-%d %H:%M')}</td>
+                        <td>{est_time.strftime('%Y-%m-%d %H:%M')}</td>
                         <td>{row['coin']}</td>
                         <td class="{funding_class}">${row['funding_payment']:,.4f}</td>
                         <td>{row['position_size']:,.4f}</td>
                         <td class="{rate_class}">{row['funding_rate']:.2f}</td>
+                        <td>${row.get('token_price', 0):,.2f}</td>
+                        <td class="{calc_funding_class}">${row.get('calculated_funding', 0):,.4f}</td>
                     </tr>
 """
                 html += """
