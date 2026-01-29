@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 CONFIG_FILE = "config_hyperliquid.json"
 TESTNET = False
 REPORT_PERIOD = "allTime"
-LOOKBACK_DAYS = 30
+LOOKBACK_DAYS = 90
 EMAIL_TO = "silvaac@yahoo.com"
 EMAIL_SUBJECT_TEMPLATE = "Performance Report - {account} - {date}"
 OUTPUT_DIR = "reports"
@@ -71,8 +71,7 @@ def main():
         report_data = reporter.generate_report_data(
             period=REPORT_PERIOD,
             start_time=start_time,
-            end_time=end_time,
-            lookback_days=LOOKBACK_DAYS
+            end_time=end_time
         )
         
         logger.info("Creating visualizations...")

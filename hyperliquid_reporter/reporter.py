@@ -55,10 +55,14 @@ class HyperliquidReporter(BaseReporter):
         
         Returns:
             DataFrame with datetime index and columns:
-            - aum_usd: Account value in USD
+            - aum_usd: Account value in USD (includes spot + perp)
         
         Raises:
             ReportGenerationError: If unable to generate AUM data.
+        
+        Note:
+            Hyperliquid's accountValueHistory API returns total account value
+            including both perpetual and spot balances.
         """
         try:
             df = self.monitor.get_portfolio_dataframe(period=period, data_type="account_value")
@@ -80,31 +84,130 @@ class HyperliquidReporter(BaseReporter):
         
         Returns:
             DataFrame with datetime index and columns:
-            - pnl_usd: Cumulative P&L in USD
-            - pnl_pct: Cumulative P&L as percentage
+            - pnl_usd: Total P&L in USD (realized + unrealized)
+            - pnl_pct: Total P&L as percentage
             - aum_usd: Account value for reference
         
         Raises:
             ReportGenerationError: If unable to generate performance data.
+        
+        Note:
+            The pnl_usd includes both realized P&L (from closed trades) and
+            unrealized P&L (from open positions). Historical data points show
+            realized P&L at that time, while the latest point includes current
+            unrealized P&L.
         """
         try:
-            df = self.monitor.get_portfolio_dataframe(period=period, data_type="both")
+            # Get account value history (includes total value with unrealized P&L)
+            df = self.monitor.get_portfolio_dataframe(period=period, data_type="account_value")
             
             if df.empty:
                 logger.warning("No performance data available for period: %s", period)
                 return pd.DataFrame(columns=["pnl_usd", "pnl_pct", "aum_usd"])
             
             df = df.rename(columns={"account_value": "aum_usd"})
-            df = df.rename(columns={"pnl": "pnl_usd"})
             
-            if "aum_usd" in df.columns and not df["aum_usd"].empty:
-                initial_value = df["aum_usd"].iloc[0]
-                if initial_value > 0:
-                    df["pnl_pct"] = (df["pnl_usd"] / initial_value) * 100
+            # Get deposit/withdrawal history to calculate net deposits at each point
+            # We need to reconstruct net_deposits over time from ledger data
+            try:
+                from datetime import timedelta
+                
+                # Get ledger updates for the entire history period
+                # Start from 1 year before first account value to catch early deposits
+                if not df.empty:
+                    first_time_ms = int(df.index[0].timestamp() * 1000)
+                    start_time_ms = first_time_ms - (365 * 24 * 60 * 60 * 1000)  # 1 year before
+                    end_time_ms = int(df.index[-1].timestamp() * 1000)
+                    
+                    ledger_updates = self.monitor._info.user_non_funding_ledger_updates(
+                        self.monitor._address,
+                        start_time_ms,
+                        end_time_ms
+                    )
+                    
+                    # Build a time series of cumulative net deposits
+                    deposits_timeline = []
+                    cumulative_deposits = 0.0
+                    
+                    for update in ledger_updates:
+                        delta = update.get("delta", {})
+                        time_ms = update.get("time", 0)
+                        
+                        if "type" in delta:
+                            if delta["type"] == "deposit":
+                                usdc_amount = float(delta.get("usdc", 0.0))
+                                cumulative_deposits += usdc_amount
+                            elif delta["type"] == "withdraw":
+                                usdc_amount = float(delta.get("usdc", 0.0))
+                                cumulative_deposits -= abs(usdc_amount)
+                            elif delta["type"] == "subAccountTransfer":
+                                usdc_amount = float(delta.get("usdc", 0.0))
+                                cumulative_deposits += usdc_amount
+                            
+                            deposits_timeline.append({
+                                'timestamp': pd.to_datetime(time_ms, unit='ms'),
+                                'net_deposits': cumulative_deposits
+                            })
+                    
+                    # Create deposits dataframe and merge with account value
+                    if deposits_timeline:
+                        deposits_df = pd.DataFrame(deposits_timeline)
+                        # Use merge_asof to get the net_deposits value at or before each timestamp
+                        # Reset index to make timestamp a column for merge_asof
+                        df_with_time = df.reset_index()
+                        df_with_time = pd.merge_asof(
+                            df_with_time.sort_values('timestamp'),
+                            deposits_df.sort_values('timestamp'),
+                            on='timestamp',
+                            direction='backward'
+                        )
+                        # Set index back and handle NaN values
+                        df = df_with_time.set_index('timestamp')
+                        df['net_deposits'] = df['net_deposits'].fillna(0.0)
+                    else:
+                        df['net_deposits'] = 0.0
+                    
+                    logger.info(f"Reconstructed net deposits timeline with {len(deposits_timeline)} deposit/withdrawal events")
                 else:
-                    df["pnl_pct"] = 0.0
-            else:
-                df["pnl_pct"] = 0.0
+                    df['net_deposits'] = 0.0
+                    
+            except Exception as e:
+                logger.warning(f"Could not reconstruct net deposits timeline: {e}")
+                # Fallback: use current net deposits for all points
+                try:
+                    account_summary = self.monitor.get_account_summary()
+                    current_net_deposits = account_summary.get("net_deposits", 0.0)
+                    df['net_deposits'] = current_net_deposits
+                except Exception:
+                    df['net_deposits'] = 0.0
+            
+            # Ensure first row has aum_usd = net_deposits (initial state with no P&L)
+            if len(df) > 0 and df["aum_usd"].iloc[0] == 0.0 and df["net_deposits"].iloc[0] > 0:
+                # If first AUM is 0 but there are deposits, set AUM to equal deposits
+                df.iloc[0, df.columns.get_loc("aum_usd")] = df["net_deposits"].iloc[0]
+            
+            # Calculate P&L based on period-over-period changes
+            # pnl_usd(t) = aum_usd(t) - aum_usd(t-1) - (net_deposits(t) - net_deposits(t-1))
+            # pnl_pct(t) = pnl_usd(t) / aum_usd(t-1)
+            df["pnl_usd"] = 0.0  # First row is zero
+            df["pnl_pct"] = 0.0  # First row is zero
+            
+            if len(df) > 1:
+                # Calculate P&L for each period starting from the second row
+                for i in range(1, len(df)):
+                    # Change in AUM between consecutive periods
+                    aum_change = df["aum_usd"].iloc[i] - df["aum_usd"].iloc[i-1]
+                    # Change in deposits between consecutive periods
+                    deposit_change = df["net_deposits"].iloc[i] - df["net_deposits"].iloc[i-1]
+                    # P&L for this period
+                    period_pnl = aum_change - deposit_change
+                    
+                    df.iloc[i, df.columns.get_loc("pnl_usd")] = period_pnl
+                    
+                    # P&L percentage based on previous period's AUM
+                    if df["aum_usd"].iloc[i-1] > 0:
+                        period_pct = (period_pnl / df["aum_usd"].iloc[i-1]) * 100
+                        df.iloc[i, df.columns.get_loc("pnl_pct")] = period_pct
             
             return df
         except Exception as e:
@@ -131,6 +234,9 @@ class HyperliquidReporter(BaseReporter):
             - fee: Trading fee
             - closed_pnl: Realized P&L from closing position
             - net_pnl: Net P&L (closed_pnl - fee)
+            - fee_bps: Fee in basis points
+            - feeToken: Token used for fee payment
+            - dir: Direction of trade
         
         Raises:
             ReportGenerationError: If unable to generate trade analysis.
@@ -146,7 +252,7 @@ class HyperliquidReporter(BaseReporter):
                 logger.warning("No trade data available")
                 return pd.DataFrame(columns=[
                     "coin", "side", "price", "size", "notional", 
-                    "fee", "closed_pnl", "net_pnl"
+                    "fee", "closed_pnl", "net_pnl", "fee_bps", "feeToken", "dir"
                 ])
             
             result_df = pd.DataFrame()
@@ -160,6 +266,11 @@ class HyperliquidReporter(BaseReporter):
             result_df["closed_pnl"] = trades_df["closedPnl"].astype(float)
             result_df["net_pnl"] = result_df["closed_pnl"] - result_df["fee"]
             
+            # Add additional columns from token_data
+            result_df["fee_bps"] = trades_df["fee_bps"].astype(float)
+            result_df["feeToken"] = trades_df["feeToken"]
+            result_df["dir"] = trades_df["dir"]
+            
             result_df.index = trades_df.index
             
             return result_df
@@ -170,7 +281,7 @@ class HyperliquidReporter(BaseReporter):
         self,
         start_time: Optional[datetime] = None,
         end_time: Optional[datetime] = None,
-        lookback_days: int = 30,
+        lookback_days: Optional[int] = None,
     ) -> pd.DataFrame:
         """Generate funding cost analysis for perpetual positions.
         
@@ -220,7 +331,7 @@ class HyperliquidReporter(BaseReporter):
         period: str = "allTime",
         start_time: Optional[datetime] = None,
         end_time: Optional[datetime] = None,
-        lookback_days: int = 30,
+        lookback_days: int = 180,
     ) -> dict[str, Any]:
         """Generate all report data.
         
@@ -251,13 +362,18 @@ class HyperliquidReporter(BaseReporter):
                 start_time=start_time,
                 end_time=end_time
             )
-            funding_analysis = self.generate_funding_analysis(
-                start_time=start_time,
-                end_time=end_time,
-                lookback_days=lookback_days
-            )
+            # Get all-time funding data (no time constraints)
+            funding_analysis = self.generate_funding_analysis()
             
             account_summary = self.monitor.get_account_summary(lookback_days=3650)
+            
+            # Save current P&L snapshot to history file
+            current_aum = account_summary.get("current_value", 0.0)
+            current_net_deposits = account_summary.get("net_deposits", 0.0)
+            self._save_pnl_history(current_aum, current_net_deposits)
+            
+            # Load P&L history from file
+            pnl_history = self._load_pnl_history()
             
             summary_stats = self._calculate_summary_stats(
                 aum_data=aum_data,
@@ -272,6 +388,7 @@ class HyperliquidReporter(BaseReporter):
                 "performance_data": performance_data,
                 "trade_analysis": trade_analysis,
                 "funding_analysis": funding_analysis,
+                "pnl_history": pnl_history,  # Add historical data
                 "summary_stats": summary_stats,
                 "account_summary": account_summary,
                 "period": period,
@@ -302,13 +419,15 @@ class HyperliquidReporter(BaseReporter):
         """
         stats = {}
         
+        # Use real-time current_value from account_summary for accuracy
+        # accountValueHistory can be stale
+        stats["current_aum"] = account_summary.get("current_value", 0.0)
+        
         if not aum_data.empty and "aum_usd" in aum_data.columns:
-            stats["current_aum"] = float(aum_data["aum_usd"].iloc[-1])
             stats["initial_aum"] = float(aum_data["aum_usd"].iloc[0])
             stats["peak_aum"] = float(aum_data["aum_usd"].max())
             stats["min_aum"] = float(aum_data["aum_usd"].min())
         else:
-            stats["current_aum"] = 0.0
             stats["initial_aum"] = 0.0
             stats["peak_aum"] = 0.0
             stats["min_aum"] = 0.0
@@ -410,6 +529,10 @@ class HyperliquidReporter(BaseReporter):
             if funding_img:
                 visualizations["funding_chart"] = funding_img
             
+            funding_by_coin_img = self._create_funding_by_coin_chart(report_data["funding_analysis"])
+            if funding_by_coin_img:
+                visualizations["funding_by_coin_chart"] = funding_by_coin_img
+            
             trade_img = self._create_trade_distribution_chart(report_data["trade_analysis"])
             if trade_img:
                 visualizations["trade_distribution"] = trade_img
@@ -462,27 +585,31 @@ class HyperliquidReporter(BaseReporter):
         
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
         
+        # Calculate cumulative values for the charts
+        cumulative_pnl_usd = performance_data["pnl_usd"].cumsum()
+        cumulative_pnl_pct = performance_data["pnl_pct"].cumsum()
+        
         if "pnl_usd" in performance_data.columns:
-            ax1.plot(performance_data.index, performance_data["pnl_usd"], 
-                    linewidth=2, color="#A23B72", label="P&L (USD)")
+            ax1.plot(performance_data.index, cumulative_pnl_usd, 
+                    linewidth=2, color="#A23B72", label="Cumulative P&L (USD)")
             ax1.axhline(y=0, color='black', linestyle='--', alpha=0.3)
-            ax1.fill_between(performance_data.index, performance_data["pnl_usd"], 0,
-                           where=(performance_data["pnl_usd"] >= 0), alpha=0.3, color="green")
-            ax1.fill_between(performance_data.index, performance_data["pnl_usd"], 0,
-                           where=(performance_data["pnl_usd"] < 0), alpha=0.3, color="red")
+            ax1.fill_between(performance_data.index, cumulative_pnl_usd, 0,
+                           where=(cumulative_pnl_usd >= 0), alpha=0.3, color="green")
+            ax1.fill_between(performance_data.index, cumulative_pnl_usd, 0,
+                           where=(cumulative_pnl_usd < 0), alpha=0.3, color="red")
             ax1.set_title("Cumulative P&L (USD)", fontsize=14, fontweight="bold")
             ax1.set_ylabel("P&L (USD)", fontsize=12)
             ax1.grid(True, alpha=0.3)
             ax1.legend()
         
         if "pnl_pct" in performance_data.columns:
-            ax2.plot(performance_data.index, performance_data["pnl_pct"], 
-                    linewidth=2, color="#F18F01", label="P&L (%)")
+            ax2.plot(performance_data.index, cumulative_pnl_pct, 
+                    linewidth=2, color="#F18F01", label="Cumulative P&L (%)")
             ax2.axhline(y=0, color='black', linestyle='--', alpha=0.3)
-            ax2.fill_between(performance_data.index, performance_data["pnl_pct"], 0,
-                           where=(performance_data["pnl_pct"] >= 0), alpha=0.3, color="green")
-            ax2.fill_between(performance_data.index, performance_data["pnl_pct"], 0,
-                           where=(performance_data["pnl_pct"] < 0), alpha=0.3, color="red")
+            ax2.fill_between(performance_data.index, cumulative_pnl_pct, 0,
+                           where=(cumulative_pnl_pct >= 0), alpha=0.3, color="green")
+            ax2.fill_between(performance_data.index, cumulative_pnl_pct, 0,
+                           where=(cumulative_pnl_pct < 0), alpha=0.3, color="red")
             ax2.set_title("Cumulative P&L (%)", fontsize=14, fontweight="bold")
             ax2.set_xlabel("Date", fontsize=12)
             ax2.set_ylabel("P&L (%)", fontsize=12)
@@ -497,6 +624,81 @@ class HyperliquidReporter(BaseReporter):
         
         return self._fig_to_base64(fig)
     
+    def _save_pnl_history(self, aum_usd: float, net_deposits: float) -> None:
+        """Save current P&L snapshot to history file.
+        
+        Args:
+            aum_usd: Current assets under management.
+            net_deposits: Current net deposits.
+        """
+        from pathlib import Path
+        
+        history_file = Path("pnl_history.csv")
+        current_time = pd.Timestamp.now()
+        
+        # Create new row
+        new_row = pd.DataFrame({
+            'datetime': [current_time],
+            'aum_usd': [aum_usd],
+            'net_deposits': [net_deposits]
+        })
+        
+        # Append to file or create new file
+        if history_file.exists():
+            new_row.to_csv(history_file, mode='a', header=False, index=False)
+        else:
+            new_row.to_csv(history_file, mode='w', header=True, index=False)
+        
+        logger.info(f"Saved P&L snapshot to {history_file}")
+    
+    def _load_pnl_history(self) -> pd.DataFrame:
+        """Load P&L history from file and calculate performance metrics.
+        
+        Returns:
+            DataFrame with historical P&L data including calculated pnl_usd and pnl_pct.
+        """
+        from pathlib import Path
+        
+        history_file = Path("pnl_history.csv")
+        
+        if not history_file.exists():
+            logger.info(f"P&L history file {history_file} does not exist")
+            return pd.DataFrame()
+        
+        try:
+            # Load historical data
+            df = pd.read_csv(history_file)
+            df['datetime'] = pd.to_datetime(df['datetime'])
+            df.set_index('datetime', inplace=True)
+            
+            # Sort by datetime
+            df = df.sort_index()
+            
+            # Calculate P&L using same algorithm as performance_data
+            # pnl_usd(t) = aum_usd(t) - aum_usd(t-1) - (net_deposits(t) - net_deposits(t-1))
+            # pnl_pct(t) = pnl_usd(t) / aum_usd(t-1)
+            df["pnl_usd"] = 0.0  # First row is zero
+            df["pnl_pct"] = 0.0  # First row is zero
+            
+            if len(df) > 1:
+                for i in range(1, len(df)):
+                    aum_change = df["aum_usd"].iloc[i] - df["aum_usd"].iloc[i-1]
+                    deposit_change = df["net_deposits"].iloc[i] - df["net_deposits"].iloc[i-1]
+                    period_pnl = aum_change - deposit_change
+                    
+                    df.iloc[i, df.columns.get_loc("pnl_usd")] = period_pnl
+                    
+                    if df["aum_usd"].iloc[i-1] > 0:
+                        period_pct = (period_pnl / df["aum_usd"].iloc[i-1]) * 100
+                        df.iloc[i, df.columns.get_loc("pnl_pct")] = period_pct
+            
+            logger.info(f"Loaded P&L history with {len(df)} entries from {history_file}")
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error loading P&L history from {history_file}: {e}")
+            return pd.DataFrame()
+    
     def _create_funding_chart(self, funding_data: pd.DataFrame) -> Optional[str]:
         """Create funding costs chart.
         
@@ -509,7 +711,7 @@ class HyperliquidReporter(BaseReporter):
         if funding_data.empty or "funding_payment" not in funding_data.columns:
             return None
         
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
+        fig, ax1 = plt.subplots(1, 1, figsize=(12, 6))
         
         cumulative_funding = funding_data["funding_payment"].cumsum()
         ax1.plot(funding_data.index, cumulative_funding, linewidth=2, color="#6A4C93")
@@ -517,21 +719,39 @@ class HyperliquidReporter(BaseReporter):
         ax1.axhline(y=0, color='black', linestyle='--', alpha=0.3)
         ax1.set_title("Cumulative Funding Costs", fontsize=14, fontweight="bold")
         ax1.set_ylabel("Cumulative Funding (USD)", fontsize=12)
+        ax1.set_xlabel("Date", fontsize=12)
         ax1.grid(True, alpha=0.3)
-        
-        if "coin" in funding_data.columns:
-            funding_by_coin = funding_data.groupby("coin")["funding_payment"].sum().sort_values()
-            
-            colors = ['green' if x >= 0 else 'red' for x in funding_by_coin.values]
-            funding_by_coin.plot(kind='barh', ax=ax2, color=colors, alpha=0.7)
-            ax2.axvline(x=0, color='black', linestyle='--', alpha=0.3)
-            ax2.set_title("Total Funding by Coin", fontsize=14, fontweight="bold")
-            ax2.set_xlabel("Total Funding (USD)", fontsize=12)
-            ax2.set_ylabel("Coin", fontsize=12)
-            ax2.grid(True, alpha=0.3, axis='x')
         
         ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
         fig.autofmt_xdate()
+        plt.tight_layout()
+        
+        return self._fig_to_base64(fig)
+    
+    def _create_funding_by_coin_chart(self, funding_data: pd.DataFrame) -> Optional[str]:
+        """Create funding by coin chart.
+        
+        Args:
+            funding_data: Funding DataFrame.
+        
+        Returns:
+            Base64-encoded image string or None if no data.
+        """
+        if funding_data.empty or "coin" not in funding_data.columns:
+            return None
+        
+        fig, ax = plt.subplots(1, 1, figsize=(12, 6))
+        
+        funding_by_coin = funding_data.groupby("coin")["funding_payment"].sum().sort_values()
+        
+        colors = ['green' if x >= 0 else 'red' for x in funding_by_coin.values]
+        funding_by_coin.plot(kind='barh', ax=ax, color=colors, alpha=0.7)
+        ax.axvline(x=0, color='black', linestyle='--', alpha=0.3)
+        ax.set_title("Total Funding by Coin", fontsize=14, fontweight="bold")
+        ax.set_xlabel("Total Funding (USD)", fontsize=12)
+        ax.set_ylabel("Coin", fontsize=12)
+        ax.grid(True, alpha=0.3, axis='x')
+        
         plt.tight_layout()
         
         return self._fig_to_base64(fig)
@@ -802,6 +1022,132 @@ class HyperliquidReporter(BaseReporter):
         <div class="chart">
             <img src="data:image/png;base64,{visualizations['performance_chart']}" alt="Performance Chart">
         </div>
+"""
+                
+                # Add performance data table
+                performance_data = report_data["performance_data"]
+                if not performance_data.empty:
+                    # Create formatted data for display (don't modify original dataframe)
+                    display_data = performance_data.copy()
+                    display_data['aum_usd'] = display_data['aum_usd'].round(2)
+                    display_data['net_deposits'] = display_data['net_deposits'].round(2)
+                    display_data['pnl_pct'] = (display_data['pnl_pct'] * 100).round(2)  # Convert to basis points
+                    
+                    # Add cumulative P&L columns for display
+                    display_data['cumulative_pnl_usd'] = display_data['pnl_usd'].cumsum()
+                    display_data['cumulative_pnl_pct'] = display_data['pnl_pct'].cumsum()
+                    
+                    html += """
+        <h3>Performance Data</h3>
+        <div style="overflow-x: auto;">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Date (UTC)</th>
+                        <th>Date (EST)</th>
+                        <th>AUM (USD)</th>
+                        <th>Net Deposits (USD)</th>
+                        <th>P&L (USD)</th>
+                        <th>P&L (bp)</th>
+                        <th>Cumulative P&L (USD)</th>
+                        <th>Cumulative P&L (bp)</th>
+                    </tr>
+                </thead>
+                <tbody>
+"""
+                    # Show last 20 entries in reverse chronological order
+                    recent_performance = display_data.tail(20).sort_index(ascending=False)
+                    for idx, row in recent_performance.iterrows():
+                        pnl_class = "positive-value" if row["pnl_usd"] >= 0 else "negative-value"
+                        pnl_pct_class = "positive-value" if row["pnl_pct"] >= 0 else "negative-value"
+                        cum_pnl_class = "positive-value" if row["cumulative_pnl_usd"] >= 0 else "negative-value"
+                        cum_pct_class = "positive-value" if row["cumulative_pnl_pct"] >= 0 else "negative-value"
+                        
+                        # Convert UTC to EST (UTC-5)
+                        est_time = idx - pd.Timedelta(hours=5)
+                        
+                        html += f"""
+                    <tr>
+                        <td>{idx.strftime('%Y-%m-%d %H:%M')}</td>
+                        <td>{est_time.strftime('%Y-%m-%d %H:%M')}</td>
+                        <td>${row['aum_usd']:,.2f}</td>
+                        <td>${row['net_deposits']:,.2f}</td>
+                        <td class="{pnl_class}">${row['pnl_usd']:,.2f}</td>
+                        <td class="{pnl_pct_class}">{row['pnl_pct']:,.2f}</td>
+                        <td class="{cum_pnl_class}">${row['cumulative_pnl_usd']:,.2f}</td>
+                        <td class="{cum_pct_class}">{row['cumulative_pnl_pct']:,.2f}</td>
+                    </tr>
+"""
+                    html += """
+                </tbody>
+            </table>
+        </div>
+"""
+                
+                html += """
+    </div>
+"""
+            
+            # Add Performance from file section
+            pnl_history = report_data.get("pnl_history", pd.DataFrame())
+            if not pnl_history.empty:
+                # Create formatted data for display (don't modify original dataframe)
+                display_history = pnl_history.copy()
+                display_history['aum_usd'] = display_history['aum_usd'].round(2)
+                display_history['net_deposits'] = display_history['net_deposits'].round(2)
+                display_history['pnl_pct'] = (display_history['pnl_pct'] * 100).round(2)  # Convert to basis points
+                
+                # Add cumulative P&L columns for display
+                display_history['cumulative_pnl_usd'] = display_history['pnl_usd'].cumsum()
+                display_history['cumulative_pnl_pct'] = display_history['pnl_pct'].cumsum()
+                
+                html += f"""
+    <div class="section">
+        <h3>📊 Performance from File</h3>
+        <p><strong>Historical P&L data from pnl_history.csv ({len(pnl_history)} entries)</strong></p>
+        <div style="overflow-x: auto;">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Date (UTC)</th>
+                        <th>Date (EST)</th>
+                        <th>AUM (USD)</th>
+                        <th>Net Deposits (USD)</th>
+                        <th>P&L (USD)</th>
+                        <th>P&L (bp)</th>
+                        <th>Cumulative P&L (USD)</th>
+                        <th>Cumulative P&L (bp)</th>
+                    </tr>
+                </thead>
+                <tbody>
+"""
+                # Show all entries in reverse chronological order
+                recent_history = display_history.sort_index(ascending=False)
+                for idx, row in recent_history.iterrows():
+                    pnl_class = "positive-value" if row["pnl_usd"] >= 0 else "negative-value"
+                    pnl_pct_class = "positive-value" if row["pnl_pct"] >= 0 else "negative-value"
+                    cum_pnl_class = "positive-value" if row["cumulative_pnl_usd"] >= 0 else "negative-value"
+                    cum_pct_class = "positive-value" if row["cumulative_pnl_pct"] >= 0 else "negative-value"
+                    
+                    # Convert EST to UTC (EST+5)
+                    utc_time = idx + pd.Timedelta(hours=5)
+                    
+                    html += f"""
+                    <tr>
+                        <td>{utc_time.strftime('%Y-%m-%d %H:%M')}</td>
+                        <td>{idx.strftime('%Y-%m-%d %H:%M')}</td>
+                        <td>${row['aum_usd']:,.2f}</td>
+                        <td>${row['net_deposits']:,.2f}</td>
+                        <td class="{pnl_class}">${row['pnl_usd']:,.2f}</td>
+                        <td class="{pnl_pct_class}">{row['pnl_pct']:,.2f}</td>
+                        <td class="{cum_pnl_class}">${row['cumulative_pnl_usd']:,.2f}</td>
+                        <td class="{cum_pct_class}">${row['cumulative_pnl_pct']:,.2f}</td>
+                    </tr>
+"""
+                html += """
+                </tbody>
+            </table>
+        </div>
     </div>
 """
             
@@ -852,13 +1198,17 @@ class HyperliquidReporter(BaseReporter):
             <table>
                 <thead>
                     <tr>
-                        <th>Date</th>
+                        <th>Date (UTC)</th>
+                        <th>Date (EST)</th>
                         <th>Coin</th>
                         <th>Side</th>
                         <th>Price</th>
                         <th>Size</th>
                         <th>Notional</th>
                         <th>Fee</th>
+                        <th>Fee (bps)</th>
+                        <th>Fee Token</th>
+                        <th>Direction</th>
                         <th>Net P&L</th>
                     </tr>
                 </thead>
@@ -866,15 +1216,23 @@ class HyperliquidReporter(BaseReporter):
 """
                 for idx, row in recent_trades.iterrows():
                     pnl_class = "positive-value" if row["net_pnl"] >= 0 else "negative-value"
+                    
+                    # Convert UTC to EST (UTC-5)
+                    est_time = idx - pd.Timedelta(hours=5)
+                    
                     html += f"""
                     <tr>
                         <td>{idx.strftime('%Y-%m-%d %H:%M')}</td>
+                        <td>{est_time.strftime('%Y-%m-%d %H:%M')}</td>
                         <td>{row['coin']}</td>
                         <td>{row['side']}</td>
                         <td>${row['price']:,.4f}</td>
                         <td>{row['size']:,.4f}</td>
                         <td>${row['notional']:,.2f}</td>
                         <td>${row['fee']:,.2f}</td>
+                        <td>{row['fee_bps']:.1f}</td>
+                        <td>{row['feeToken']}</td>
+                        <td>{row['dir']}</td>
                         <td class="{pnl_class}">${row['net_pnl']:,.2f}</td>
                     </tr>
 """
@@ -884,6 +1242,7 @@ class HyperliquidReporter(BaseReporter):
         </div>
 """
             
+                        
             html += """
     </div>
 """
@@ -938,6 +1297,69 @@ class HyperliquidReporter(BaseReporter):
         </div>
 """
             
+            # Add detailed funding analysis table
+            funding_analysis = report_data["funding_analysis"]
+            if not funding_analysis.empty:
+                # Create formatted data for display (don't modify original dataframe)
+                display_funding = funding_analysis.copy()
+                display_funding['funding_rate'] = (display_funding['funding_rate'] * 10000).round(2)  # Convert to basis points
+                
+                html += f"""
+        <h3>Funding Analysis Details ({len(funding_analysis)} entries)</h3>
+        <div style="overflow-x: auto;">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Date (UTC)</th>
+                        <th>Date (EST)</th>
+                        <th>Coin</th>
+                        <th>Funding Payment (USD)</th>
+                        <th>Position Size</th>
+                        <th>Funding Rate (bps)</th>
+                    </tr>
+                </thead>
+                <tbody>
+"""
+                # Show last 20 entries in reverse chronological order
+                recent_funding = display_funding.tail(20).sort_index(ascending=False)
+                for idx, row in recent_funding.iterrows():
+                    funding_class = "positive-value" if row["funding_payment"] >= 0 else "negative-value"
+                    rate_class = "positive-value" if row["funding_rate"] >= 0 else "negative-value"
+                    
+                    # Convert EST to UTC (EST+5)
+                    utc_time = idx + pd.Timedelta(hours=5)
+                    
+                    html += f"""
+                    <tr>
+                        <td>{utc_time.strftime('%Y-%m-%d %H:%M')}</td>
+                        <td>{idx.strftime('%Y-%m-%d %H:%M')}</td>
+                        <td>{row['coin']}</td>
+                        <td class="{funding_class}">${row['funding_payment']:,.4f}</td>
+                        <td>{row['position_size']:,.4f}</td>
+                        <td class="{rate_class}">{row['funding_rate']:.2f}</td>
+                    </tr>
+"""
+                html += """
+                </tbody>
+            </table>
+        </div>
+"""
+            
+            html += """
+    </div>
+"""
+            
+            # Add funding by coin chart at the end
+            if "funding_by_coin_chart" in visualizations:
+                html += f"""
+    <div class="section">
+        <h2>💰 Funding by Coin</h2>
+        <div class="chart">
+            <img src="data:image/png;base64,{visualizations['funding_by_coin_chart']}" alt="Funding by Coin Chart">
+        </div>
+    </div>
+"""
+    
             html += """
     </div>
     

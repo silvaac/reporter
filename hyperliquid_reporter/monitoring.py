@@ -421,7 +421,7 @@ class HyperliquidMonitor(PortfolioMonitor):
                 self._address,
                 start_date=start_date,
                 end_date=end_date,
-                lookback=lookback if lookback is not None else 30,
+                lookback=lookback if lookback is not None else 3650,  # 10 years for all-time data
                 info=self._info
             )
             
@@ -519,34 +519,129 @@ class HyperliquidMonitor(PortfolioMonitor):
                 except Exception:
                     pass
 
-            spot_value = 0.0
+            # Get total account value from portfolio history
+            # accountValueHistory includes both perp and spot values
+            total_account_value = 0.0
+            try:
+                portfolio_data = self._info.portfolio(self._address)
+                for period_name, data in portfolio_data:
+                    if period_name == "allTime":
+                        account_history = data.get("accountValueHistory", [])
+                        if account_history:
+                            # Get the most recent value
+                            latest = account_history[-1]
+                            total_account_value = _safe_float(latest[1])
+                            break
+            except Exception as e:
+                logger.warning(f"Failed to get account value history: {e}")
+            
+            # Calculate spot value as: total - perp
+            # This is more accurate than trying to value individual spot tokens
+            spot_value = max(0.0, total_account_value - perp_value)
+            current_value = float(total_account_value if total_account_value > 0 else perp_value)
+            
+            # Calculate spot unrealized P&L
+            # For each non-USDC token: unrealized = current_value - entry_cost
+            # USDC has no unrealized P&L (it's the base currency)
+            spot_unrealized_pnl = 0.0
             try:
                 spot_state = self._info.spot_user_state(self._address)
-                # Hyperliquid spot balances are not always trivially convertible to USDC
-                # without additional price feeds. If spot_state provides a USD total,
-                # prefer it; otherwise fall back to 0.0.
-                for key in ("totalValue", "totalUsd", "accountValue", "total"):
-                    if key in spot_state:
-                        try:
-                            spot_value = _safe_float(spot_state.get(key) or 0.0)
-                            break
-                        except Exception:
-                            pass
-            except Exception:
-                spot_value = 0.0
+                usdc_balance = 0.0
+                
+                for balance in spot_state.get('balances', []):
+                    coin = balance.get('coin', '')
+                    entry_ntl = _safe_float(balance.get('entryNtl', 0.0))
+                    
+                    if coin == 'USDC':
+                        # USDC is the base currency, track its balance
+                        usdc_balance = _safe_float(balance.get('total', 0.0))
+                    else:
+                        # For non-USDC tokens: current value = (spot_value - USDC)
+                        # But we need to calculate per-token, so use entry cost as proxy
+                        # Since we can't easily get individual token current values,
+                        # we calculate: (total_spot - USDC) - sum(non-USDC entry costs)
+                        pass
+                
+                # Calculate total entry cost for non-USDC tokens
+                total_non_usdc_entry = sum(
+                    _safe_float(b.get('entryNtl', 0.0)) 
+                    for b in spot_state.get('balances', []) 
+                    if b.get('coin') != 'USDC'
+                )
+                
+                # Current value of non-USDC tokens = total spot value - USDC balance
+                non_usdc_current_value = spot_value - usdc_balance
+                
+                # Unrealized P&L on non-USDC tokens
+                spot_unrealized_pnl = non_usdc_current_value - total_non_usdc_entry
+                
+                logger.info(f"Spot: total=${spot_value:.2f}, USDC=${usdc_balance:.2f}, non-USDC current=${non_usdc_current_value:.2f}, entry=${total_non_usdc_entry:.2f}, unrealized=${spot_unrealized_pnl:.2f}")
+            except Exception as e:
+                logger.warning(f"Failed to calculate spot unrealized P&L: {e}")
+            
+            # Total unrealized P&L = perp unrealized + spot unrealized
+            unrealized_pnl += spot_unrealized_pnl
+            
+            logger.info(f"Total account value: ${total_account_value:.2f}, Perp: ${perp_value:.2f}, Spot: ${spot_value:.2f}, Unrealized P&L: ${unrealized_pnl:.2f}")
 
-            current_value = float(perp_value + spot_value)
+            # Fetch deposits and withdrawals from ledger
+            total_deposits = 0.0
+            total_withdrawals = 0.0
+            
+            try:
+                # Calculate start time based on lookback_days
+                from datetime import timedelta
+                end_time_ms = int(datetime.now().timestamp() * 1000)
+                start_time_ms = int((datetime.now() - timedelta(days=lookback_days)).timestamp() * 1000)
+                
+                # Fetch non-funding ledger updates (includes deposits, withdrawals, transfers)
+                ledger_updates = self._info.user_non_funding_ledger_updates(
+                    self._address,
+                    start_time_ms,
+                    end_time_ms
+                )
+                
+                for update in ledger_updates:
+                    delta = update.get("delta", {})
+                    
+                    # Handle deposit
+                    if "type" in delta and delta["type"] == "deposit":
+                        usdc_amount = _safe_float(delta.get("usdc", 0.0))
+                        total_deposits += usdc_amount
+                    
+                    # Handle withdrawal
+                    elif "type" in delta and delta["type"] == "withdraw":
+                        usdc_amount = _safe_float(delta.get("usdc", 0.0))
+                        total_withdrawals += abs(usdc_amount)
+                    
+                    # Handle internal transfers (subAccountTransfer)
+                    elif "type" in delta and delta["type"] == "subAccountTransfer":
+                        usdc_amount = _safe_float(delta.get("usdc", 0.0))
+                        if usdc_amount > 0:
+                            total_deposits += usdc_amount
+                        else:
+                            total_withdrawals += abs(usdc_amount)
+                
+                logger.info(f"Fetched ledger data: deposits=${total_deposits:.2f}, withdrawals=${total_withdrawals:.2f}")
+            
+            except Exception as e:
+                logger.warning(f"Failed to fetch ledger updates in fallback: {e}")
+                # Continue with 0.0 values if ledger fetch fails
+
+            net_deposits = total_deposits - total_withdrawals
+            total_pnl = current_value - net_deposits
+            pnl_percentage = (total_pnl / net_deposits * 100) if net_deposits > 0 else 0.0
 
             summary: dict[str, Any] = {
-                "total_deposits": 0.0,
-                "total_withdrawals": 0.0,
-                "net_deposits": 0.0,
+                "total_deposits": total_deposits,
+                "total_withdrawals": total_withdrawals,
+                "net_deposits": net_deposits,
                 "current_value": current_value,
                 "spot_value": spot_value,
                 "perp_value": perp_value,
                 "perp_position_value": perp_position_value,
-                "total_pnl": current_value,
-                "pnl_percentage": 0.0,
+                "total_pnl": total_pnl,
+                "pnl_percentage": pnl_percentage,
                 "unrealized_pnl": unrealized_pnl,
                 "cash_in_perp": _safe_float(margin_summary.get("availableBalance", 0.0) or 0.0),
                 "when": None,
