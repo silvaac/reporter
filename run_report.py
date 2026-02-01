@@ -37,6 +37,9 @@ LOOKBACK_DAYS = 90
 EMAIL_TO = "silvaac@yahoo.com"
 EMAIL_SUBJECT_TEMPLATE = "Performance Report - {account} - {date}"
 OUTPUT_DIR = "reports"
+PNL_HISTORY_FILE = "pnl_history.csv"
+PRICE_CACHE_DIR = "./data/hyperliquid"
+REPORT_FILENAME_TEMPLATE = "trading_report_{timestamp}.html"
 
 
 def main():
@@ -62,7 +65,12 @@ def main():
         monitor = HyperliquidMonitor(info=info, address=account_address)
         
         logger.info("Initializing reporter...")
-        reporter = HyperliquidReporter(monitor=monitor, account_address=account_address)
+        reporter = HyperliquidReporter(
+            monitor=monitor,
+            account_address=account_address,
+            pnl_history_file=PNL_HISTORY_FILE,
+            price_cache_dir=PRICE_CACHE_DIR
+        )
         
         logger.info("Generating report data (period: %s)...", REPORT_PERIOD)
         end_time = datetime.now()
@@ -89,7 +97,8 @@ def main():
         output_path = Path(OUTPUT_DIR)
         output_path.mkdir(parents=True, exist_ok=True)
         
-        report_filename = f"trading_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        report_filename = REPORT_FILENAME_TEMPLATE.format(timestamp=timestamp)
         report_path = output_path / report_filename
         
         with open(report_path, 'w', encoding='utf-8') as f:

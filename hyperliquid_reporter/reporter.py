@@ -36,16 +36,28 @@ class HyperliquidReporter(BaseReporter):
         account_address: The account address being reported on.
     """
     
-    def __init__(self, monitor: HyperliquidMonitor, account_address: str) -> None:
+    def __init__(
+        self,
+        monitor: HyperliquidMonitor,
+        account_address: str,
+        pnl_history_file: str = "pnl_history.csv",
+        price_cache_dir: str = "./data/hyperliquid"
+    ) -> None:
         """Initialize the Hyperliquid reporter.
         
         Args:
             monitor: HyperliquidMonitor instance.
             account_address: The account address to report on.
+            pnl_history_file: Path to P&L history CSV file.
+            price_cache_dir: Directory for caching price data.
         """
         self.monitor = monitor
         self.account_address = account_address
+        self.pnl_history_file = pnl_history_file
+        self.price_cache_dir = price_cache_dir
         logger.info("Initialized HyperliquidReporter for account %s", account_address[:10] + "...")
+        logger.info("P&L history file: %s", pnl_history_file)
+        logger.info("Price cache directory: %s", price_cache_dir)
     
     def generate_aum_data(self, period: str = "allTime") -> pd.DataFrame:
         """Generate AUM (Assets Under Management) data over time.
@@ -451,7 +463,7 @@ class HyperliquidReporter(BaseReporter):
             # This will automatically save to local files and reuse them
             price_manager = HyperliquidPerpManager(
                 ticker=unique_coins,
-                data_dir="./data/hyperliquid",  # Local cache directory
+                data_dir=self.price_cache_dir,  # Local cache directory
                 interval="1h",  # 1-hour candles for matching
                 file_type="parquet",  # Use parquet for efficient storage
                 update=True,  # Update with new data
@@ -783,8 +795,11 @@ class HyperliquidReporter(BaseReporter):
         """
         from pathlib import Path
         
-        history_file = Path("pnl_history.csv")
+        history_file = Path(self.pnl_history_file)
         current_time = pd.Timestamp.now()
+        
+        # Create parent directories if they don't exist
+        history_file.parent.mkdir(parents=True, exist_ok=True)
         
         # Create new row
         new_row = pd.DataFrame({
@@ -809,7 +824,7 @@ class HyperliquidReporter(BaseReporter):
         """
         from pathlib import Path
         
-        history_file = Path("pnl_history.csv")
+        history_file = Path(self.pnl_history_file)
         
         if not history_file.exists():
             logger.info(f"P&L history file {history_file} does not exist")
