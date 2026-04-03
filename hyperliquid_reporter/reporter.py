@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import base64
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Optional
@@ -83,6 +83,10 @@ class HyperliquidReporter(BaseReporter):
                 logger.warning("No AUM data available for period: %s", period)
                 return pd.DataFrame(columns=["aum_usd"])
             
+            # Ensure UTC-aware index
+            if df.index.tz is None:
+                df.index = df.index.tz_localize('UTC')
+            
             df = df.rename(columns={"account_value": "aum_usd"})
             return df
         except Exception as e:
@@ -116,6 +120,10 @@ class HyperliquidReporter(BaseReporter):
             if df.empty:
                 logger.warning("No performance data available for period: %s", period)
                 return pd.DataFrame(columns=["pnl_usd", "pnl_pct", "aum_usd"])
+            
+            # Ensure UTC-aware index
+            if df.index.tz is None:
+                df.index = df.index.tz_localize('UTC')
             
             df = df.rename(columns={"account_value": "aum_usd"})
             
@@ -157,7 +165,7 @@ class HyperliquidReporter(BaseReporter):
                                 cumulative_deposits += usdc_amount
                             
                             deposits_timeline.append({
-                                'timestamp': pd.to_datetime(time_ms, unit='ms'),
+                                'timestamp': pd.to_datetime(time_ms, unit='ms', utc=True),
                                 'net_deposits': cumulative_deposits
                             })
                     
@@ -193,6 +201,9 @@ class HyperliquidReporter(BaseReporter):
                 except Exception:
                     df['net_deposits'] = 0.0
             
+            # Resample to daily frequency for uniform time intervals
+            df = self._resample_to_daily(df)
+            
             # Ensure first row has aum_usd = net_deposits (initial state with no P&L)
             if len(df) > 0 and df["aum_usd"].iloc[0] == 0.0 and df["net_deposits"].iloc[0] > 0:
                 # If first AUM is 0 but there are deposits, set AUM to equal deposits
@@ -224,6 +235,82 @@ class HyperliquidReporter(BaseReporter):
             return df
         except Exception as e:
             raise ReportGenerationError(f"Failed to generate performance data: {e}") from e
+    
+    def _resample_to_daily(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Resample DataFrame to uniform daily intervals.
+        
+        Uses last value of day for aum_usd and net_deposits (forward-fill for gaps).
+        
+        Args:
+            df: DataFrame with DatetimeIndex and at least 'aum_usd' column.
+        
+        Returns:
+            DataFrame resampled to daily frequency.
+        """
+        if df.empty:
+            return df
+        
+        # Resample to daily: take the last value of each day
+        daily = df.resample('D').last()
+        
+        # Forward-fill gaps (days with no data carry previous day's values)
+        daily = daily.ffill()
+        
+        # Drop any rows that are still NaN (before first data point)
+        daily = daily.dropna(subset=['aum_usd'])
+        
+        return daily
+    
+    def generate_monthly_performance(self, performance_data: pd.DataFrame) -> pd.DataFrame:
+        """Generate monthly performance summary from daily performance data.
+        
+        Args:
+            performance_data: Daily performance DataFrame with columns:
+                aum_usd, net_deposits, pnl_usd, pnl_pct.
+        
+        Returns:
+            DataFrame with one row per calendar month and columns:
+                month, starting_aum, ending_aum, pnl_usd, pnl_pct,
+                cumulative_pnl_usd, cumulative_pnl_pct.
+        """
+        if performance_data.empty:
+            return pd.DataFrame(columns=[
+                "month", "starting_aum", "ending_aum",
+                "pnl_usd", "pnl_pct",
+                "cumulative_pnl_usd", "cumulative_pnl_pct",
+            ])
+        
+        monthly_rows = []
+        # Group by year-month (convert to tz-naive to avoid warning)
+        perf_data_naive = performance_data.copy()
+        perf_data_naive.index = perf_data_naive.index.tz_localize(None)
+        grouped = perf_data_naive.groupby(perf_data_naive.index.to_period('M'))
+        
+        for period, group in grouped:
+            starting_aum = float(group["aum_usd"].iloc[0])
+            ending_aum = float(group["aum_usd"].iloc[-1])
+            month_pnl_usd = float(group["pnl_usd"].sum())
+            
+            # Monthly return %: sum of daily P&L / starting AUM
+            if starting_aum > 0:
+                month_pnl_pct = (month_pnl_usd / starting_aum) * 100
+            else:
+                month_pnl_pct = 0.0
+            
+            monthly_rows.append({
+                "month": str(period),
+                "starting_aum": starting_aum,
+                "ending_aum": ending_aum,
+                "pnl_usd": month_pnl_usd,
+                "pnl_pct": round(month_pnl_pct, 2),
+            })
+        
+        result = pd.DataFrame(monthly_rows)
+        if not result.empty:
+            result["cumulative_pnl_usd"] = result["pnl_usd"].cumsum()
+            result["cumulative_pnl_pct"] = result["pnl_pct"].cumsum()
+        
+        return result
     
     def generate_trade_analysis(
         self,
@@ -418,7 +505,7 @@ class HyperliquidReporter(BaseReporter):
                 "summary_stats": summary_stats,
                 "account_summary": account_summary,
                 "period": period,
-                "generated_at": datetime.now(),
+                "generated_at": datetime.now(timezone.utc),
             }
         except Exception as e:
             raise ReportGenerationError(f"Failed to generate report data: {e}") from e
@@ -789,6 +876,10 @@ class HyperliquidReporter(BaseReporter):
     def _save_pnl_history(self, aum_usd: float, net_deposits: float) -> None:
         """Save current P&L snapshot to history file.
         
+        If net_deposits is 0 but the previous snapshot had deposits > 0,
+        the last known net_deposits value is carried forward to prevent
+        phantom P&L from erroneous zero values (e.g. ledger fetch failure).
+        
         Args:
             aum_usd: Current assets under management.
             net_deposits: Current net deposits.
@@ -796,10 +887,25 @@ class HyperliquidReporter(BaseReporter):
         from pathlib import Path
         
         history_file = Path(self.pnl_history_file)
-        current_time = pd.Timestamp.now()
+        current_time = pd.Timestamp.now(tz='UTC')
         
         # Create parent directories if they don't exist
         history_file.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Carry forward last known net_deposits if new value is 0 but previous was > 0
+        if net_deposits == 0.0 and history_file.exists():
+            try:
+                existing = pd.read_csv(history_file)
+                if not existing.empty:
+                    last_net_deposits = existing['net_deposits'].iloc[-1]
+                    if last_net_deposits > 0:
+                        logger.warning(
+                            "net_deposits=0 but previous was %.2f; carrying forward",
+                            last_net_deposits,
+                        )
+                        net_deposits = last_net_deposits
+            except Exception as e:
+                logger.warning(f"Could not read previous net_deposits for carry-forward: {e}")
         
         # Create new row
         new_row = pd.DataFrame({
@@ -833,7 +939,8 @@ class HyperliquidReporter(BaseReporter):
         try:
             # Load historical data
             df = pd.read_csv(history_file)
-            df['datetime'] = pd.to_datetime(df['datetime'])
+            # Use format='ISO8601' to handle both tz-naive and tz-aware timestamps
+            df['datetime'] = pd.to_datetime(df['datetime'], format='ISO8601', utc=True)
             df.set_index('datetime', inplace=True)
             
             # Sort by datetime
@@ -1162,7 +1269,7 @@ class HyperliquidReporter(BaseReporter):
         <h1>📊 Trading Performance Report</h1>
         <p><strong>Account:</strong> {self.account_address[:10]}...{self.account_address[-8:]}</p>
         <p><strong>Period:</strong> {report_data['period']}</p>
-        <p><strong>Generated:</strong> {generated_at.strftime('%Y-%m-%d %H:%M:%S UTC')}</p>
+        <p><strong>Generated:</strong> {generated_at.strftime('%Y-%m-%d %H:%M:%S')} UTC</p>
     </div>
     
     <div class="section">
@@ -1230,7 +1337,7 @@ class HyperliquidReporter(BaseReporter):
                     display_data = performance_data.copy()
                     display_data['aum_usd'] = display_data['aum_usd'].round(2)
                     display_data['net_deposits'] = display_data['net_deposits'].round(2)
-                    display_data['pnl_pct'] = (display_data['pnl_pct'] * 100).round(2)  # Convert to basis points
+                    display_data['pnl_pct'] = display_data['pnl_pct'].round(2)
                     
                     # Add cumulative P&L columns for display
                     display_data['cumulative_pnl_usd'] = display_data['pnl_usd'].cumsum()
@@ -1247,9 +1354,9 @@ class HyperliquidReporter(BaseReporter):
                         <th>AUM (USD)</th>
                         <th>Net Deposits (USD)</th>
                         <th>P&L (USD)</th>
-                        <th>P&L (bp)</th>
+                        <th>P&L (%)</th>
                         <th>Cumulative P&L (USD)</th>
-                        <th>Cumulative P&L (bp)</th>
+                        <th>Cumulative P&L (%)</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -1262,8 +1369,8 @@ class HyperliquidReporter(BaseReporter):
                         cum_pnl_class = "positive-value" if row["cumulative_pnl_usd"] >= 0 else "negative-value"
                         cum_pct_class = "positive-value" if row["cumulative_pnl_pct"] >= 0 else "negative-value"
                         
-                        # Convert UTC to EST (UTC-5)
-                        est_time = idx - pd.Timedelta(hours=5)
+                        # Convert UTC to US/Eastern (handles EST/EDT automatically)
+                        est_time = idx.tz_convert('US/Eastern') if idx.tzinfo else idx - pd.Timedelta(hours=5)
                         
                         html += f"""
                     <tr>
@@ -1287,6 +1394,52 @@ class HyperliquidReporter(BaseReporter):
     </div>
 """
             
+            # Add Monthly Performance section
+            performance_data = report_data.get("performance_data", pd.DataFrame())
+            if not performance_data.empty:
+                monthly_perf = self.generate_monthly_performance(performance_data)
+                if not monthly_perf.empty:
+                    html += """
+    <div class="section">
+        <h2>📅 Monthly Performance</h2>
+        <div style="overflow-x: auto;">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Month</th>
+                        <th>Starting AUM (USD)</th>
+                        <th>Ending AUM (USD)</th>
+                        <th>P&L (USD)</th>
+                        <th>P&L (%)</th>
+                        <th>Cumulative P&L (USD)</th>
+                        <th>Cumulative P&L (%)</th>
+                    </tr>
+                </thead>
+                <tbody>
+"""
+                    for _, mrow in monthly_perf.iterrows():
+                        m_pnl_class = "positive-value" if mrow["pnl_usd"] >= 0 else "negative-value"
+                        m_pct_class = "positive-value" if mrow["pnl_pct"] >= 0 else "negative-value"
+                        m_cum_class = "positive-value" if mrow["cumulative_pnl_usd"] >= 0 else "negative-value"
+                        m_cum_pct_class = "positive-value" if mrow["cumulative_pnl_pct"] >= 0 else "negative-value"
+                        html += f"""
+                    <tr>
+                        <td>{mrow['month']}</td>
+                        <td>${mrow['starting_aum']:,.2f}</td>
+                        <td>${mrow['ending_aum']:,.2f}</td>
+                        <td class="{m_pnl_class}">${mrow['pnl_usd']:,.2f}</td>
+                        <td class="{m_pct_class}">{mrow['pnl_pct']:.2f}%</td>
+                        <td class="{m_cum_class}">${mrow['cumulative_pnl_usd']:,.2f}</td>
+                        <td class="{m_cum_pct_class}">{mrow['cumulative_pnl_pct']:.2f}%</td>
+                    </tr>
+"""
+                    html += """
+                </tbody>
+            </table>
+        </div>
+    </div>
+"""
+            
             # Add Performance from file section
             pnl_history = report_data.get("pnl_history", pd.DataFrame())
             if not pnl_history.empty:
@@ -1294,7 +1447,7 @@ class HyperliquidReporter(BaseReporter):
                 display_history = pnl_history.copy()
                 display_history['aum_usd'] = display_history['aum_usd'].round(2)
                 display_history['net_deposits'] = display_history['net_deposits'].round(2)
-                display_history['pnl_pct'] = (display_history['pnl_pct'] * 100).round(2)  # Convert to basis points
+                display_history['pnl_pct'] = display_history['pnl_pct'].round(2)
                 
                 # Add cumulative P&L columns for display
                 display_history['cumulative_pnl_usd'] = display_history['pnl_usd'].cumsum()
@@ -1313,9 +1466,9 @@ class HyperliquidReporter(BaseReporter):
                         <th>AUM (USD)</th>
                         <th>Net Deposits (USD)</th>
                         <th>P&L (USD)</th>
-                        <th>P&L (bp)</th>
+                        <th>P&L (%)</th>
                         <th>Cumulative P&L (USD)</th>
-                        <th>Cumulative P&L (bp)</th>
+                        <th>Cumulative P&L (%)</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -1328,13 +1481,16 @@ class HyperliquidReporter(BaseReporter):
                     cum_pnl_class = "positive-value" if row["cumulative_pnl_usd"] >= 0 else "negative-value"
                     cum_pct_class = "positive-value" if row["cumulative_pnl_pct"] >= 0 else "negative-value"
                     
-                    # Convert EST to UTC (EST+5)
-                    utc_time = idx + pd.Timedelta(hours=5)
+                    # Convert UTC to US/Eastern (handles EST/EDT automatically)
+                    if idx.tzinfo:
+                        est_time = idx.tz_convert('US/Eastern')
+                    else:
+                        est_time = idx - pd.Timedelta(hours=5)
                     
                     html += f"""
                     <tr>
-                        <td>{utc_time.strftime('%Y-%m-%d %H:%M')}</td>
                         <td>{idx.strftime('%Y-%m-%d %H:%M')}</td>
+                        <td>{est_time.strftime('%Y-%m-%d %H:%M')}</td>
                         <td>${row['aum_usd']:,.2f}</td>
                         <td>${row['net_deposits']:,.2f}</td>
                         <td class="{pnl_class}">${row['pnl_usd']:,.2f}</td>
@@ -1416,8 +1572,8 @@ class HyperliquidReporter(BaseReporter):
                 for idx, row in recent_trades.iterrows():
                     pnl_class = "positive-value" if row["net_pnl"] >= 0 else "negative-value"
                     
-                    # Convert UTC to EST (UTC-5)
-                    est_time = idx - pd.Timedelta(hours=5)
+                    # Convert UTC to US/Eastern (handles EST/EDT automatically)
+                    est_time = idx.tz_convert('US/Eastern') if idx.tzinfo else idx - pd.Timedelta(hours=5)
                     
                     html += f"""
                     <tr>
@@ -1536,8 +1692,8 @@ class HyperliquidReporter(BaseReporter):
                     calc_funding_class = "positive-value" if row.get("calculated_funding", 0) >= 0 else "negative-value"
                     
                     # idx is already in UTC from token_data API
-                    # Convert UTC to EST (UTC-5)
-                    est_time = idx - pd.Timedelta(hours=5)
+                    # Convert UTC to US/Eastern (handles EST/EDT automatically)
+                    est_time = idx.tz_convert('US/Eastern') if idx.tzinfo else idx - pd.Timedelta(hours=5)
                     
                     html += f"""
                     <tr>
@@ -1611,7 +1767,7 @@ class HyperliquidReporter(BaseReporter):
             "",
             f"Account: {short_address}",
             f"Period: {period}",
-            f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC",
             "",
             "=" * 70,
             "ACCOUNT SUMMARY",

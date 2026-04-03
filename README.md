@@ -32,7 +32,8 @@ A comprehensive Python package for generating professional trading performance r
 - **📈 Visualizations**: Professional charts and graphs using matplotlib
 - **📧 Email Reports**: Automated HTML email delivery with embedded visualizations
 - **🎯 Spot & Perpetuals**: Full support for both spot and perpetual trading accounts
-- **✅ Unit Tests**: 42 comprehensive tests covering all core functionality
+- **📅 Monthly Performance**: Monthly P&L summary in $ and % with cumulative tracking
+- **✅ Unit Tests**: 73 comprehensive tests covering all core functionality
 
 ## Installation
 
@@ -231,6 +232,12 @@ with open("report.html", "w") as f:
 - Cumulative P&L in USD
 - Cumulative P&L in percentage
 - Performance visualization with color-coded gains/losses
+- Daily-resampled uniform time series
+
+### Monthly Performance
+- Monthly P&L in USD and %
+- Cumulative P&L tracking across months
+- Starting and ending AUM per month
 
 ### Trading Activity
 - Total number of trades
@@ -379,11 +386,16 @@ tests/
 ├── test_base_monitoring.py         # 8 tests for base monitoring
 ├── test_base_reporter.py           # 3 tests for base reporter
 ├── test_config.py                  # 13 tests for configuration
-├── test_hyperliquid_reporter.py    # 9 tests for reporter implementation
+├── test_hyperliquid_reporter.py    # 12 tests for reporter implementation
 ├── test_funding_enhancements.py    # 1 test for funding enhancements
 ├── test_cumulative_rate_chart.py   # Cumulative rate chart verification
 ├── test_funding_timezone.py        # Timezone handling verification
 ├── test_price_matching.py          # Price matching verification
+├── test_datetime_handling.py       # UTC/EST timezone handling
+├── test_net_deposits_carryforward.py # Net deposits carry-forward logic
+├── test_pnl_display_units.py       # P&L display units (% not bp)
+├── test_daily_resample.py          # Daily resampling verification
+├── test_monthly_performance.py     # Monthly performance aggregation
 ├── debug_price_data.py             # Price data structure debugging
 ├── conftest.py                     # Shared fixtures
 └── README.md                       # Testing documentation
@@ -400,6 +412,11 @@ tests/
 - ✅ Funding enhancements (token prices, calculated funding)
 - ✅ Price matching with UTC timezone handling
 - ✅ Cumulative funding rate chart generation
+- ✅ UTC-aware timestamps and US/Eastern conversion (DST-safe)
+- ✅ Net deposits carry-forward (prevents phantom P&L)
+- ✅ P&L display units (% columns, no double conversion)
+- ✅ Daily resampling of non-uniform time series
+- ✅ Monthly performance aggregation
 
 ### Testing Workflow
 
@@ -699,13 +716,22 @@ For issues, questions, or contributions:
 
 ## Changelog
 
-### Version 1.1.0 (Current)
+### Version 1.2.0 (Current)
+- ✅ Fixed datetime handling: all timestamps now UTC-aware
+- ✅ Fixed EST conversion: uses US/Eastern timezone (handles DST automatically)
+- ✅ Fixed net deposits bug: carry-forward prevents phantom P&L when ledger returns 0
+- ✅ Fixed P&L display: removed double conversion, columns now show % instead of bp
+- ✅ Fixed P&L time series: resampled to uniform daily intervals
+- ✅ Added monthly performance table with P&L in $ and %
+- ✅ 73 comprehensive unit tests (up from 42)
+
+### Version 1.1.0
 - ✅ Enhanced funding analysis with token price matching
 - ✅ Calculated funding verification (price × size × rate)
 - ✅ Cumulative funding rate chart (basis points)
 - ✅ UTC timezone-aware price matching
 - ✅ Local price data caching for performance
-- ✅ 42 comprehensive unit tests
+- ✅ 42 unit tests
 - ✅ Improved error handling and logging
 
 ### Version 1.0.0

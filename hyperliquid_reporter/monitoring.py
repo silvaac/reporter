@@ -350,6 +350,10 @@ class HyperliquidMonitor(PortfolioMonitor):
             if fills_df is None or fills_df.empty:
                 return pd.DataFrame() if as_dataframe else []
             
+            # Ensure index is UTC-aware for comparison
+            if fills_df.index.tz is None:
+                fills_df.index = fills_df.index.tz_localize('UTC')
+            
             # Apply filters
             if start_time is not None:
                 fills_df = fills_df[fills_df.index >= start_time]
@@ -427,6 +431,10 @@ class HyperliquidMonitor(PortfolioMonitor):
             
             if funding_df is None or funding_df.empty:
                 return pd.DataFrame() if as_dataframe else []
+            
+            # Ensure index is UTC-aware for comparison
+            if funding_df.index.tz is None:
+                funding_df.index = funding_df.index.tz_localize('UTC')
             
             # Apply additional time filters if specified (client-side filtering)
             # This handles cases where the API returns more data than requested

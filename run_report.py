@@ -14,7 +14,7 @@ Configuration:
 
 import logging
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from config import load_config
@@ -73,7 +73,7 @@ def main():
         )
         
         logger.info("Generating report data (period: %s)...", REPORT_PERIOD)
-        end_time = datetime.now()
+        end_time = datetime.now(timezone.utc)
         start_time = end_time - timedelta(days=LOOKBACK_DAYS)
         
         report_data = reporter.generate_report_data(
@@ -97,7 +97,7 @@ def main():
         output_path = Path(OUTPUT_DIR)
         output_path.mkdir(parents=True, exist_ok=True)
         
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        timestamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
         report_filename = REPORT_FILENAME_TEMPLATE.format(timestamp=timestamp)
         report_path = output_path / report_filename
         
@@ -115,7 +115,7 @@ def main():
         network = "Testnet" if TESTNET else "Mainnet"
         subject = EMAIL_SUBJECT_TEMPLATE.format(
             account=short_address,
-            date=datetime.now().strftime('%Y-%m-%d')
+            date=datetime.now(timezone.utc).strftime('%Y-%m-%d')
         )
         subject = f"{subject} [{network}]"
         
