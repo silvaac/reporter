@@ -142,3 +142,119 @@ class TestPnlHistoryTimestamps:
             parsed = parsed.tz_localize("UTC")
         diff = abs((utc_now - parsed).total_seconds())
         assert diff < 60, f"Saved timestamp should be close to current UTC time, diff={diff}s"
+
+
+class TestDoubleLocalizeSafety:
+    """Regression: feeding already-UTC data must not crash (double-localize bug)."""
+
+    @pytest.fixture
+    def mock_monitor(self):
+        monitor = Mock()
+        mock_info = MagicMock()
+        mock_info.user_non_funding_ledger_updates.return_value = []
+        monitor._info = mock_info
+        monitor._address = "0x123"
+        monitor.get_account_summary.return_value = {"net_deposits": 10000.0}
+        return monitor
+
+    @pytest.fixture
+    def reporter(self, mock_monitor):
+        return HyperliquidReporter(
+            monitor=mock_monitor,
+            account_address="0x1234567890abcdef1234567890abcdef12345678",
+        )
+
+    def test_aum_data_with_already_utc_index(self, reporter, mock_monitor):
+        """generate_aum_data must not crash when fed already-UTC data."""
+        utc_index = pd.DatetimeIndex(
+            pd.date_range("2024-01-01", periods=3, tz="UTC"), name="timestamp"
+        )
+        mock_monitor.get_portfolio_dataframe.return_value = pd.DataFrame(
+            {"account_value": [10000.0, 11000.0, 12000.0]}, index=utc_index
+        )
+        result = reporter.generate_aum_data(period="month")
+        assert str(result.index.tz) == "UTC"
+
+    def test_performance_data_with_already_utc_index(self, reporter, mock_monitor):
+        """generate_performance_data must not crash when fed already-UTC data."""
+        utc_index = pd.DatetimeIndex(
+            pd.date_range("2024-01-01", periods=3, tz="UTC"), name="timestamp"
+        )
+        mock_monitor.get_portfolio_dataframe.return_value = pd.DataFrame(
+            {"account_value": [10000.0, 11000.0, 12000.0]}, index=utc_index
+        )
+        result = reporter.generate_performance_data(period="month")
+        assert str(result.index.tz) == "UTC"
+
+
+class TestNaiveInputLocalization:
+    """Feeding naive (tz-unaware) data must result in UTC output."""
+
+    @pytest.fixture
+    def mock_monitor(self):
+        monitor = Mock()
+        mock_info = MagicMock()
+        mock_info.user_non_funding_ledger_updates.return_value = []
+        monitor._info = mock_info
+        monitor._address = "0x123"
+        monitor.get_account_summary.return_value = {"net_deposits": 10000.0}
+        return monitor
+
+    @pytest.fixture
+    def reporter(self, mock_monitor):
+        return HyperliquidReporter(
+            monitor=mock_monitor,
+            account_address="0x1234567890abcdef1234567890abcdef12345678",
+        )
+
+    def test_naive_index_gets_localized_in_aum(self, reporter, mock_monitor):
+        naive_index = pd.DatetimeIndex(
+            pd.date_range("2024-01-01", periods=3), name="timestamp"
+        )
+        mock_monitor.get_portfolio_dataframe.return_value = pd.DataFrame(
+            {"account_value": [10000.0, 11000.0, 12000.0]}, index=naive_index
+        )
+        result = reporter.generate_aum_data(period="month")
+        assert result.index.tz is not None, "Naive input must be localized to UTC"
+
+    def test_naive_index_gets_localized_in_performance(self, reporter, mock_monitor):
+        naive_index = pd.DatetimeIndex(
+            pd.date_range("2024-01-01", periods=3), name="timestamp"
+        )
+        mock_monitor.get_portfolio_dataframe.return_value = pd.DataFrame(
+            {"account_value": [10000.0, 11000.0, 12000.0]}, index=naive_index
+        )
+        result = reporter.generate_performance_data(period="month")
+        assert result.index.tz is not None, "Naive input must be localized to UTC"
+
+
+class TestToEasternInHtmlReport:
+    """Verify to_eastern() produces correct DST-aware offsets used in HTML."""
+
+    def test_to_eastern_winter(self):
+        from tz_utils import to_eastern
+        ts = pd.Timestamp("2024-01-15 12:00:00", tz="UTC")
+        result = to_eastern(ts)
+        assert result.utcoffset() == timedelta(hours=-5), "Winter: should be EST (UTC-5)"
+
+    def test_to_eastern_summer(self):
+        from tz_utils import to_eastern
+        ts = pd.Timestamp("2024-07-15 12:00:00", tz="UTC")
+        result = to_eastern(ts)
+        assert result.utcoffset() == timedelta(hours=-4), "Summer: should be EDT (UTC-4)"
+
+    def test_to_eastern_naive_input(self):
+        from tz_utils import to_eastern
+        ts = pd.Timestamp("2024-01-15 12:00:00")
+        result = to_eastern(ts)
+        assert result.hour == 7, "Naive input assumed UTC, 12:00 UTC -> 07:00 EST"
+
+
+class TestMonitoringTimestampsUTC:
+    """Verify base monitoring produces UTC-aware timestamps."""
+
+    def test_performance_metrics_timestamp_is_utc(self):
+        from base.monitoring import PerformanceMetrics
+        pm = PerformanceMetrics(account_value=10000.0)
+        assert pm.timestamp.tzinfo is not None, "Default timestamp must be tz-aware"
+        assert pm.timestamp.tzinfo == timezone.utc or str(pm.timestamp.tzinfo) == "UTC"

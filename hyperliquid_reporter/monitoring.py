@@ -10,6 +10,7 @@ from hyperliquid.info import Info
 
 from base.monitoring import PerformanceMetrics, PortfolioMonitor
 from exceptions import ExchangeError
+from tz_utils import ensure_utc_index, utc_now
 
 try:
     import pandas as pd
@@ -126,7 +127,7 @@ class HyperliquidMonitor(PortfolioMonitor):
             return PerformanceMetrics(
                 account_value=account_value,
                 unrealized_pnl=unrealized_pnl,
-                timestamp=datetime.now(),
+                timestamp=utc_now(),
             )
         except Exception as e:
             raise ExchangeError(f"Failed to fetch current metrics: {e}") from e
@@ -219,7 +220,7 @@ class HyperliquidMonitor(PortfolioMonitor):
         if data_type in {"both", "account_value"}:
             for timestamp_ms, value_str in history.get("accountValueHistory", []):
                 account_value_data.append({
-                    "timestamp": pd.to_datetime(timestamp_ms, unit='ms'),
+                    "timestamp": pd.to_datetime(timestamp_ms, unit='ms', utc=True),
                     "account_value": float(value_str)
                 })
         
@@ -227,7 +228,7 @@ class HyperliquidMonitor(PortfolioMonitor):
         if data_type in {"both", "pnl"}:
             for timestamp_ms, pnl_str in history.get("pnlHistory", []):
                 pnl_data.append({
-                    "timestamp": pd.to_datetime(timestamp_ms, unit='ms'),
+                    "timestamp": pd.to_datetime(timestamp_ms, unit='ms', utc=True),
                     "pnl": float(pnl_str)
                 })
         
@@ -351,8 +352,7 @@ class HyperliquidMonitor(PortfolioMonitor):
                 return pd.DataFrame() if as_dataframe else []
             
             # Ensure index is UTC-aware for comparison
-            if fills_df.index.tz is None:
-                fills_df.index = fills_df.index.tz_localize('UTC')
+            ensure_utc_index(fills_df)
             
             # Apply filters
             if start_time is not None:
@@ -433,8 +433,7 @@ class HyperliquidMonitor(PortfolioMonitor):
                 return pd.DataFrame() if as_dataframe else []
             
             # Ensure index is UTC-aware for comparison
-            if funding_df.index.tz is None:
-                funding_df.index = funding_df.index.tz_localize('UTC')
+            ensure_utc_index(funding_df)
             
             # Apply additional time filters if specified (client-side filtering)
             # This handles cases where the API returns more data than requested
@@ -599,8 +598,8 @@ class HyperliquidMonitor(PortfolioMonitor):
             try:
                 # Calculate start time based on lookback_days
                 from datetime import timedelta
-                end_time_ms = int(datetime.now().timestamp() * 1000)
-                start_time_ms = int((datetime.now() - timedelta(days=lookback_days)).timestamp() * 1000)
+                end_time_ms = int(utc_now().timestamp() * 1000)
+                start_time_ms = int((utc_now() - timedelta(days=lookback_days)).timestamp() * 1000)
                 
                 # Fetch non-funding ledger updates (includes deposits, withdrawals, transfers)
                 ledger_updates = self._info.user_non_funding_ledger_updates(
@@ -656,7 +655,7 @@ class HyperliquidMonitor(PortfolioMonitor):
             }
 
             try:
-                summary["when"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                summary["when"] = utc_now().strftime("%Y-%m-%d %H:%M:%S")
             except Exception:
                 summary["when"] = "N/A"
 

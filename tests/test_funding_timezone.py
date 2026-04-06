@@ -7,7 +7,7 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from datetime import datetime
+from datetime import datetime, timezone
 from config import load_config
 from hyperliquid_reporter.monitoring import HyperliquidMonitor
 
@@ -30,7 +30,7 @@ print("="*80)
 print("FUNDING DATA TIMEZONE INVESTIGATION")
 print("="*80)
 print(f"\nCurrent time (local): {datetime.now()}")
-print(f"Current time (UTC): {datetime.utcnow()}")
+print(f"Current time (UTC): {datetime.now(timezone.utc)}")
 print(f"\nFunding DataFrame shape: {funding_df.shape}")
 print(f"Index name: {funding_df.index.name}")
 print(f"Index dtype: {funding_df.index.dtype}")
@@ -44,12 +44,7 @@ if not funding_df.empty:
     
     # Check time difference from now
     last_time = funding_df.index[-1]
-    now_utc = datetime.utcnow()
-    
-    # If index is timezone-aware, convert now to aware
-    if last_time.tzinfo is not None:
-        from datetime import timezone
-        now_utc = datetime.now(timezone.utc)
+    now_utc = datetime.now(timezone.utc)
     
     time_diff = now_utc - last_time
     print(f"\nTime difference from last entry to now (UTC): {time_diff}")

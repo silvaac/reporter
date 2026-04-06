@@ -6,6 +6,8 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Any, Optional
 
+from tz_utils import utc_now
+
 
 class PerformanceMetrics:
     """Container for portfolio performance metrics.
@@ -33,7 +35,7 @@ class PerformanceMetrics:
         self.unrealized_pnl = unrealized_pnl
         self.realized_pnl = realized_pnl
         self.volume = volume
-        self.timestamp = timestamp or datetime.now()
+        self.timestamp = timestamp or utc_now()
     
     def __repr__(self) -> str:
         return (

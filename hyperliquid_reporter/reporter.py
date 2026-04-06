@@ -17,6 +17,7 @@ from matplotlib.figure import Figure
 from base.reporter import BaseReporter
 from exceptions import ReportGenerationError
 from hyperliquid_reporter.monitoring import HyperliquidMonitor
+from tz_utils import ensure_utc_index, safe_strip_tz, to_eastern
 
 logger = logging.getLogger(__name__)
 
@@ -84,8 +85,7 @@ class HyperliquidReporter(BaseReporter):
                 return pd.DataFrame(columns=["aum_usd"])
             
             # Ensure UTC-aware index
-            if df.index.tz is None:
-                df.index = df.index.tz_localize('UTC')
+            ensure_utc_index(df)
             
             df = df.rename(columns={"account_value": "aum_usd"})
             return df
@@ -122,8 +122,7 @@ class HyperliquidReporter(BaseReporter):
                 return pd.DataFrame(columns=["pnl_usd", "pnl_pct", "aum_usd"])
             
             # Ensure UTC-aware index
-            if df.index.tz is None:
-                df.index = df.index.tz_localize('UTC')
+            ensure_utc_index(df)
             
             df = df.rename(columns={"account_value": "aum_usd"})
             
@@ -283,7 +282,7 @@ class HyperliquidReporter(BaseReporter):
         monthly_rows = []
         # Group by year-month (convert to tz-naive to avoid warning)
         perf_data_naive = performance_data.copy()
-        perf_data_naive.index = perf_data_naive.index.tz_localize(None)
+        perf_data_naive.index = safe_strip_tz(perf_data_naive.index)
         grouped = perf_data_naive.groupby(perf_data_naive.index.to_period('M'))
         
         for period, group in grouped:
@@ -536,8 +535,7 @@ class HyperliquidReporter(BaseReporter):
             funding_df["token_price"] = float('nan')
             
             # Ensure funding_df has UTC timezone-aware datetime index
-            if funding_df.index.tz is None:
-                funding_df.index = funding_df.index.tz_localize('UTC')
+            ensure_utc_index(funding_df)
             
             # Get date range for price data (add buffer for matching)
             min_date = funding_df.index.min()
@@ -589,8 +587,7 @@ class HyperliquidReporter(BaseReporter):
                         logger.warning(f"Price data for {coin} index is not DatetimeIndex")
                         continue
                         
-                    if price_df.index.tz is None:
-                        price_df.index = price_df.index.tz_localize('UTC')
+                    ensure_utc_index(price_df)
                     
                     # Sort price dataframe by index
                     price_df_sorted = price_df.sort_index()
@@ -1370,7 +1367,7 @@ class HyperliquidReporter(BaseReporter):
                         cum_pct_class = "positive-value" if row["cumulative_pnl_pct"] >= 0 else "negative-value"
                         
                         # Convert UTC to US/Eastern (handles EST/EDT automatically)
-                        est_time = idx.tz_convert('US/Eastern') if idx.tzinfo else idx - pd.Timedelta(hours=5)
+                        est_time = to_eastern(idx)
                         
                         html += f"""
                     <tr>
@@ -1482,10 +1479,7 @@ class HyperliquidReporter(BaseReporter):
                     cum_pct_class = "positive-value" if row["cumulative_pnl_pct"] >= 0 else "negative-value"
                     
                     # Convert UTC to US/Eastern (handles EST/EDT automatically)
-                    if idx.tzinfo:
-                        est_time = idx.tz_convert('US/Eastern')
-                    else:
-                        est_time = idx - pd.Timedelta(hours=5)
+                    est_time = to_eastern(idx)
                     
                     html += f"""
                     <tr>
@@ -1573,7 +1567,7 @@ class HyperliquidReporter(BaseReporter):
                     pnl_class = "positive-value" if row["net_pnl"] >= 0 else "negative-value"
                     
                     # Convert UTC to US/Eastern (handles EST/EDT automatically)
-                    est_time = idx.tz_convert('US/Eastern') if idx.tzinfo else idx - pd.Timedelta(hours=5)
+                    est_time = to_eastern(idx)
                     
                     html += f"""
                     <tr>
@@ -1693,7 +1687,7 @@ class HyperliquidReporter(BaseReporter):
                     
                     # idx is already in UTC from token_data API
                     # Convert UTC to US/Eastern (handles EST/EDT automatically)
-                    est_time = idx.tz_convert('US/Eastern') if idx.tzinfo else idx - pd.Timedelta(hours=5)
+                    est_time = to_eastern(idx)
                     
                     html += f"""
                     <tr>
