@@ -1490,7 +1490,7 @@ class HyperliquidReporter(BaseReporter):
                         <td class="{pnl_class}">${row['pnl_usd']:,.2f}</td>
                         <td class="{pnl_pct_class}">{row['pnl_pct']:,.2f}</td>
                         <td class="{cum_pnl_class}">${row['cumulative_pnl_usd']:,.2f}</td>
-                        <td class="{cum_pct_class}">${row['cumulative_pnl_pct']:,.2f}</td>
+                        <td class="{cum_pct_class}">{row['cumulative_pnl_pct']:,.2f}</td>
                     </tr>
 """
                 html += """
