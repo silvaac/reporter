@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import math
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
@@ -311,6 +312,117 @@ class HyperliquidReporter(BaseReporter):
         
         return result
     
+    def generate_weekly_performance(self, performance_data: pd.DataFrame) -> pd.DataFrame:
+        """Generate weekly performance summary from daily performance data.
+        
+        Args:
+            performance_data: Daily performance DataFrame with columns:
+                aum_usd, net_deposits, pnl_usd, pnl_pct.
+        
+        Returns:
+            DataFrame with one row per ISO week and columns:
+                week, starting_aum, ending_aum, pnl_usd, pnl_pct,
+                cumulative_pnl_usd, cumulative_pnl_pct.
+        """
+        if performance_data.empty:
+            return pd.DataFrame(columns=[
+                "week", "starting_aum", "ending_aum",
+                "pnl_usd", "pnl_pct",
+                "cumulative_pnl_usd", "cumulative_pnl_pct",
+            ])
+        
+        weekly_rows = []
+        perf_data_naive = performance_data.copy()
+        perf_data_naive.index = safe_strip_tz(perf_data_naive.index)
+        grouped = perf_data_naive.groupby(perf_data_naive.index.to_period('W'))
+        
+        for period, group in grouped:
+            starting_aum = float(group["aum_usd"].iloc[0])
+            ending_aum = float(group["aum_usd"].iloc[-1])
+            week_pnl_usd = float(group["pnl_usd"].sum())
+            
+            if starting_aum > 0:
+                week_pnl_pct = (week_pnl_usd / starting_aum) * 100
+            else:
+                week_pnl_pct = 0.0
+            
+            weekly_rows.append({
+                "week": str(period),
+                "starting_aum": starting_aum,
+                "ending_aum": ending_aum,
+                "pnl_usd": week_pnl_usd,
+                "pnl_pct": round(week_pnl_pct, 2),
+            })
+        
+        result = pd.DataFrame(weekly_rows)
+        if not result.empty:
+            result["cumulative_pnl_usd"] = result["pnl_usd"].cumsum()
+            result["cumulative_pnl_pct"] = result["pnl_pct"].cumsum()
+        
+        return result
+
+    def generate_daily_funding(self, funding_analysis: pd.DataFrame) -> pd.DataFrame:
+        """Generate daily funding summary by summing hourly funding payments.
+        
+        Args:
+            funding_analysis: Funding DataFrame with columns:
+                coin, funding_payment, position_size, funding_rate, etc.
+        
+        Returns:
+            DataFrame with one row per calendar day and columns:
+                date, total_funding_usd, plus one column per coin.
+        """
+        if funding_analysis.empty or "funding_payment" not in funding_analysis.columns:
+            return pd.DataFrame(columns=["date", "total_funding_usd"])
+        
+        # Strip timezone for grouping
+        df = funding_analysis.copy()
+        df.index = safe_strip_tz(df.index)
+        df["date"] = df.index.normalize()
+        
+        # Total daily funding
+        daily_total = df.groupby("date")["funding_payment"].sum().rename("total_funding_usd")
+        
+        # Per-coin daily funding
+        if "coin" in df.columns:
+            daily_by_coin = df.pivot_table(
+                index="date", columns="coin", values="funding_payment",
+                aggfunc="sum", fill_value=0.0
+            )
+            daily_by_coin.columns = [f"{c}" for c in daily_by_coin.columns]
+            result = pd.concat([daily_total, daily_by_coin], axis=1).reset_index()
+        else:
+            result = daily_total.reset_index()
+        
+        return result
+
+    def generate_weekly_funding(self, funding_analysis: pd.DataFrame) -> pd.DataFrame:
+        """Generate weekly funding summary by summing hourly funding payments.
+        
+        Args:
+            funding_analysis: Funding DataFrame with columns:
+                coin, funding_payment, etc.
+        
+        Returns:
+            DataFrame with one row per ISO week and columns:
+                week, total_funding_usd.
+        """
+        if funding_analysis.empty or "funding_payment" not in funding_analysis.columns:
+            return pd.DataFrame(columns=["week", "total_funding_usd"])
+        
+        df = funding_analysis.copy()
+        df.index = safe_strip_tz(df.index)
+        grouped = df.groupby(df.index.to_period('W'))
+        
+        weekly_rows = []
+        for period, group in grouped:
+            weekly_rows.append({
+                "week": str(period),
+                "total_funding_usd": float(group["funding_payment"].sum()),
+            })
+        
+        return pd.DataFrame(weekly_rows)
+
     def generate_trade_analysis(
         self,
         start_time: Optional[datetime] = None,
@@ -493,14 +605,22 @@ class HyperliquidReporter(BaseReporter):
                 trade_analysis=trade_analysis,
                 funding_analysis=funding_analysis,
                 account_summary=account_summary,
+                pnl_history=pnl_history,
             )
+            
+            weekly_performance = self.generate_weekly_performance(performance_data)
+            daily_funding = self.generate_daily_funding(funding_analysis)
+            weekly_funding = self.generate_weekly_funding(funding_analysis)
             
             return {
                 "aum_data": aum_data,
                 "performance_data": performance_data,
                 "trade_analysis": trade_analysis,
                 "funding_analysis": funding_analysis,
-                "pnl_history": pnl_history,  # Add historical data
+                "pnl_history": pnl_history,
+                "weekly_performance": weekly_performance,
+                "daily_funding": daily_funding,
+                "weekly_funding": weekly_funding,
                 "summary_stats": summary_stats,
                 "account_summary": account_summary,
                 "period": period,
@@ -646,6 +766,7 @@ class HyperliquidReporter(BaseReporter):
         trade_analysis: pd.DataFrame,
         funding_analysis: pd.DataFrame,
         account_summary: dict[str, Any],
+        pnl_history: Optional[pd.DataFrame] = None,
     ) -> dict[str, Any]:
         """Calculate summary statistics for the report.
         
@@ -674,14 +795,13 @@ class HyperliquidReporter(BaseReporter):
             stats["peak_aum"] = 0.0
             stats["min_aum"] = 0.0
         
-        if not performance_data.empty and "pnl_usd" in performance_data.columns:
-            stats["total_pnl_usd"] = float(performance_data["pnl_usd"].iloc[-1])
-            if "pnl_pct" in performance_data.columns:
-                stats["total_pnl_pct"] = float(performance_data["pnl_pct"].iloc[-1])
-            else:
-                stats["total_pnl_pct"] = 0.0
+        # Total P&L = current AUM minus net deposits (matches what the charts show)
+        current_aum = stats["current_aum"]
+        net_deposits = account_summary.get("net_deposits", 0.0)
+        stats["total_pnl_usd"] = current_aum - net_deposits
+        if net_deposits > 0:
+            stats["total_pnl_pct"] = (stats["total_pnl_usd"] / net_deposits) * 100
         else:
-            stats["total_pnl_usd"] = 0.0
             stats["total_pnl_pct"] = 0.0
         
         if not trade_analysis.empty:
@@ -731,6 +851,48 @@ class HyperliquidReporter(BaseReporter):
         stats["spot_value"] = account_summary.get("spot_value", 0.0)
         stats["perp_value"] = account_summary.get("perp_value", 0.0)
         stats["unrealized_pnl"] = account_summary.get("unrealized_pnl", 0.0)
+        
+        # Annualized P&L std dev from pnl_history file
+        # Resample to daily (last snapshot per day) to avoid noise from
+        # multiple intra-day snapshots, then recompute daily returns.
+        if pnl_history is not None and not pnl_history.empty and "aum_usd" in pnl_history.columns:
+            daily_hist = pnl_history[["aum_usd", "net_deposits"]].resample("D").last().dropna()
+            if len(daily_hist) > 1:
+                daily_pnl_pct = []
+                for i in range(1, len(daily_hist)):
+                    aum_change = daily_hist["aum_usd"].iloc[i] - daily_hist["aum_usd"].iloc[i - 1]
+                    dep_change = daily_hist["net_deposits"].iloc[i] - daily_hist["net_deposits"].iloc[i - 1]
+                    period_pnl = aum_change - dep_change
+                    prev_aum = daily_hist["aum_usd"].iloc[i - 1]
+                    if prev_aum > 0:
+                        daily_pnl_pct.append((period_pnl / prev_aum) * 100)
+                    else:
+                        daily_pnl_pct.append(0.0)
+                if len(daily_pnl_pct) > 1:
+                    daily_std = float(pd.Series(daily_pnl_pct).std())
+                    stats["pnl_std_ann_pct"] = daily_std * math.sqrt(365)
+                else:
+                    stats["pnl_std_ann_pct"] = 0.0
+            else:
+                stats["pnl_std_ann_pct"] = 0.0
+        else:
+            stats["pnl_std_ann_pct"] = 0.0
+        
+        # Annualized average funding rate over last 5, 10, 30 calendar days
+        # funding_rate is per-hour; annualize by * 24 * 365
+        if not funding_analysis.empty and "funding_rate" in funding_analysis.columns:
+            now = funding_analysis.index.max()
+            for days in [5, 10, 30]:
+                cutoff = now - pd.Timedelta(days=days)
+                window = funding_analysis[funding_analysis.index >= cutoff]["funding_rate"]
+                if len(window) > 0:
+                    avg_rate = float(window.mean())
+                    stats[f"avg_funding_rate_{days}d_ann_pct"] = avg_rate * 24 * 365 * 100
+                else:
+                    stats[f"avg_funding_rate_{days}d_ann_pct"] = 0.0
+        else:
+            for days in [5, 10, 30]:
+                stats[f"avg_funding_rate_{days}d_ann_pct"] = 0.0
         
         return stats
     
@@ -1304,6 +1466,22 @@ class HyperliquidReporter(BaseReporter):
                 <div class="metric-label">Peak AUM</div>
                 <div class="metric-value">${stats.get('peak_aum', 0):,.2f}</div>
             </div>
+            <div class="metric-card">
+                <div class="metric-label">Avg Funding Rate 5d (Ann.)</div>
+                <div class="metric-value">{stats.get('avg_funding_rate_5d_ann_pct', 0):.2f}%</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Avg Funding Rate 10d (Ann.)</div>
+                <div class="metric-value">{stats.get('avg_funding_rate_10d_ann_pct', 0):.2f}%</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Avg Funding Rate 30d (Ann.)</div>
+                <div class="metric-value">{stats.get('avg_funding_rate_30d_ann_pct', 0):.2f}%</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">P&L Std Dev (Ann.)</div>
+                <div class="metric-value">{stats.get('pnl_std_ann_pct', 0):.2f}%</div>
+            </div>
         </div>
     </div>
 """
@@ -1358,8 +1536,8 @@ class HyperliquidReporter(BaseReporter):
                 </thead>
                 <tbody>
 """
-                    # Show last 20 entries in reverse chronological order
-                    recent_performance = display_data.tail(20).sort_index(ascending=False)
+                    # Show last 10 entries in reverse chronological order
+                    recent_performance = display_data.tail(10).sort_index(ascending=False)
                     for idx, row in recent_performance.iterrows():
                         pnl_class = "positive-value" if row["pnl_usd"] >= 0 else "negative-value"
                         pnl_pct_class = "positive-value" if row["pnl_pct"] >= 0 else "negative-value"
@@ -1437,6 +1615,50 @@ class HyperliquidReporter(BaseReporter):
     </div>
 """
             
+            # Add Weekly Performance section
+            weekly_perf = report_data.get("weekly_performance", pd.DataFrame())
+            if not weekly_perf.empty:
+                html += """
+    <div class="section">
+        <h2>📅 Weekly Performance</h2>
+        <div style="overflow-x: auto;">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Week</th>
+                        <th>Starting AUM (USD)</th>
+                        <th>Ending AUM (USD)</th>
+                        <th>P&L (USD)</th>
+                        <th>P&L (%)</th>
+                        <th>Cumulative P&L (USD)</th>
+                        <th>Cumulative P&L (%)</th>
+                    </tr>
+                </thead>
+                <tbody>
+"""
+                for _, wrow in weekly_perf.sort_index(ascending=False).iterrows():
+                    w_pnl_class = "positive-value" if wrow["pnl_usd"] >= 0 else "negative-value"
+                    w_pct_class = "positive-value" if wrow["pnl_pct"] >= 0 else "negative-value"
+                    w_cum_class = "positive-value" if wrow["cumulative_pnl_usd"] >= 0 else "negative-value"
+                    w_cum_pct_class = "positive-value" if wrow["cumulative_pnl_pct"] >= 0 else "negative-value"
+                    html += f"""
+                    <tr>
+                        <td>{wrow['week']}</td>
+                        <td>${wrow['starting_aum']:,.2f}</td>
+                        <td>${wrow['ending_aum']:,.2f}</td>
+                        <td class="{w_pnl_class}">${wrow['pnl_usd']:,.2f}</td>
+                        <td class="{w_pct_class}">{wrow['pnl_pct']:.2f}%</td>
+                        <td class="{w_cum_class}">${wrow['cumulative_pnl_usd']:,.2f}</td>
+                        <td class="{w_cum_pct_class}">{wrow['cumulative_pnl_pct']:.2f}%</td>
+                    </tr>
+"""
+                html += """
+                </tbody>
+            </table>
+        </div>
+    </div>
+"""
+
             # Add Performance from file section
             pnl_history = report_data.get("pnl_history", pd.DataFrame())
             if not pnl_history.empty:
@@ -1707,6 +1929,76 @@ class HyperliquidReporter(BaseReporter):
         </div>
 """
             
+            # Add Daily Funding table (last 30 days, newest first)
+            daily_funding = report_data.get("daily_funding", pd.DataFrame())
+            if not daily_funding.empty and "total_funding_usd" in daily_funding.columns:
+                # Determine coin columns (all columns except 'date' and 'total_funding_usd')
+                coin_cols = [c for c in daily_funding.columns if c not in ("date", "total_funding_usd")]
+                # Show last 30 days newest first
+                recent_daily = daily_funding.tail(30).sort_values("date", ascending=False)
+                coin_headers = "".join(f"<th>{c}</th>" for c in coin_cols)
+                html += f"""
+        <h3>Daily Funding (Last 30 Days)</h3>
+        <div style="overflow-x: auto;">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Date</th>
+                        <th>Total Funding (USD)</th>
+                        {coin_headers}
+                    </tr>
+                </thead>
+                <tbody>
+"""
+                for _, drow in recent_daily.iterrows():
+                    total_class = "positive-value" if drow["total_funding_usd"] >= 0 else "negative-value"
+                    coin_cells = "".join(
+                        f'<td class="{"positive-value" if drow.get(c, 0) >= 0 else "negative-value"}">${drow.get(c, 0):,.4f}</td>'
+                        for c in coin_cols
+                    )
+                    date_str = drow["date"].strftime('%Y-%m-%d') if hasattr(drow["date"], 'strftime') else str(drow["date"])
+                    html += f"""
+                    <tr>
+                        <td>{date_str}</td>
+                        <td class="{total_class}">${drow['total_funding_usd']:,.4f}</td>
+                        {coin_cells}
+                    </tr>
+"""
+                html += """
+                </tbody>
+            </table>
+        </div>
+"""
+
+            # Add Weekly Funding table
+            weekly_funding = report_data.get("weekly_funding", pd.DataFrame())
+            if not weekly_funding.empty and "total_funding_usd" in weekly_funding.columns:
+                html += """
+        <h3>Weekly Funding</h3>
+        <div style="overflow-x: auto;">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Week</th>
+                        <th>Total Funding (USD)</th>
+                    </tr>
+                </thead>
+                <tbody>
+"""
+                for _, wfrow in weekly_funding.sort_values("week", ascending=False).iterrows():
+                    wf_class = "positive-value" if wfrow["total_funding_usd"] >= 0 else "negative-value"
+                    html += f"""
+                    <tr>
+                        <td>{wfrow['week']}</td>
+                        <td class="{wf_class}">${wfrow['total_funding_usd']:,.4f}</td>
+                    </tr>
+"""
+                html += """
+                </tbody>
+            </table>
+        </div>
+"""
+
             html += """
     </div>
 """
