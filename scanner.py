@@ -142,7 +142,7 @@ def compute_scanner_table(
         n_vol_hours = volume_days * 24
         vol_tail = merged.tail(n_vol_hours)
         dollar_vol = vol_tail["close"] * vol_tail["volume"]
-        row[f"{volume_days}d Med Hourly $Vol (M)"] = round(dollar_vol.median() / 1e6, 1)
+        row[f"{volume_days}d Med Hourly $Vol (K)"] = round(dollar_vol.median() / 1e3)
 
         rows.append(row)
 
@@ -193,7 +193,7 @@ def generate_scan_html(
             elif col in text_cols:
                 cells += f"<td>{val}</td>"
             elif "$Vol" in col or "Vol" in col:
-                cells += f"<td>{val:,.1f}</td>"
+                cells += f"<td>{val:,.0f}</td>"
             else:
                 css = "positive-value" if val >= 0 else "negative-value"
                 cells += f'<td class="{css}">{val:,.1f}%</td>'
