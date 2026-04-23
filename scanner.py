@@ -147,6 +147,10 @@ def compute_scanner_table(
         rows.append(row)
 
     df = pd.DataFrame(rows)
+    # Sort by 30d mean funding rate, largest first
+    sort_col = f"{lookback_days[-1]}d Mean FR (Ann%)"
+    if sort_col in df.columns:
+        df = df.sort_values(sort_col, ascending=False).reset_index(drop=True)
     return df
 
 
@@ -154,9 +158,13 @@ def compute_scanner_table(
 # HTML generation  (mirrors existing report styling)
 # ---------------------------------------------------------------------------
 
+DEFAULT_HIGHLIGHT_TOKENS = {"ETH", "BTC", "HYPE", "SOL"}
+
+
 def generate_scan_html(
     df: pd.DataFrame,
     title: str = "Hyperliquid Funding & Perp Scanner (Hourly Data)",
+    highlight_tokens: set[str] = DEFAULT_HIGHLIGHT_TOKENS,
 ) -> str:
     """Render the scanner DataFrame as a styled HTML document.
 
@@ -175,6 +183,8 @@ def generate_scan_html(
     # Build table body
     body_rows = ""
     for _, row in df.iterrows():
+        is_highlight = row["Token"] in highlight_tokens
+        tr_class = ' class="highlight-row"' if is_highlight else ""
         cells = ""
         for col in df.columns:
             val = row[col]
@@ -187,7 +197,7 @@ def generate_scan_html(
             else:
                 css = "positive-value" if val >= 0 else "negative-value"
                 cells += f'<td class="{css}">{val:,.1f}%</td>'
-        body_rows += f"<tr>{cells}</tr>\n"
+        body_rows += f"<tr{tr_class}>{cells}</tr>\n"
 
     html = f"""
 <!DOCTYPE html>
@@ -261,6 +271,12 @@ def generate_scan_html(
         .negative-value {{
             color: #E74C3C;
             font-weight: 600;
+        }}
+        .highlight-row {{
+            background-color: #FFFDE7;
+        }}
+        .highlight-row:hover {{
+            background-color: #FFF9C4;
         }}
         .footer {{
             text-align: center;
