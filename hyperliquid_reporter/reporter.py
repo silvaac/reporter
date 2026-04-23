@@ -334,7 +334,8 @@ class HyperliquidReporter(BaseReporter):
         weekly_rows = []
         perf_data_naive = performance_data.copy()
         perf_data_naive.index = safe_strip_tz(perf_data_naive.index)
-        grouped = perf_data_naive.groupby(perf_data_naive.index.to_period('W'))
+        # Use W-SAT: weeks end on Saturday (Sunday through Saturday grouping)
+        grouped = perf_data_naive.groupby(perf_data_naive.index.to_period('W-SAT'))
         
         for period, group in grouped:
             starting_aum = float(group["aum_usd"].iloc[0])
@@ -412,7 +413,8 @@ class HyperliquidReporter(BaseReporter):
         
         df = funding_analysis.copy()
         df.index = safe_strip_tz(df.index)
-        grouped = df.groupby(df.index.to_period('W'))
+        # Use W-SAT: weeks end on Saturday
+        grouped = df.groupby(df.index.to_period('W-SAT'))
         
         weekly_rows = []
         for period, group in grouped:
@@ -759,6 +761,105 @@ class HyperliquidReporter(BaseReporter):
             funding_df["token_price"] = 0.0
             return funding_df
     
+    def _load_market_funding_rates(
+        self,
+        coins: list[str],
+        stale_days: int = 2,
+    ) -> pd.DataFrame:
+        """Load market-wide hourly funding rates for given coins from local parquet files.
+        
+        For each coin, reads ``{price_cache_dir}/funding/{coin}.parquet``. If the
+        file's most recent datetime is older than ``stale_days``, missing data is
+        pulled via ``HyperliquidFundingManager`` and saved back to disk.
+        
+        Args:
+            coins: List of coin symbols (e.g. ["ETH", "HYPE"]).
+            stale_days: File is considered stale if last row is older than this many days.
+        
+        Returns:
+            DataFrame with UTC DatetimeIndex and columns: ``funding_rate``, ``coin``.
+            Returns empty DataFrame on failure or if no data is available.
+        """
+        funding_dir = Path(self.price_cache_dir) / "funding"
+        if not funding_dir.exists():
+            logger.warning(f"Funding directory does not exist: {funding_dir}")
+            return pd.DataFrame(columns=["funding_rate", "coin"])
+        
+        now_utc = pd.Timestamp.now(tz="UTC")
+        stale_cutoff = now_utc - pd.Timedelta(days=stale_days)
+        
+        # Figure out which coins need a refresh
+        stale_coins: list[str] = []
+        per_coin_df: dict[str, pd.DataFrame] = {}
+        
+        for coin in coins:
+            fpath = funding_dir / f"{coin}.parquet"
+            if not fpath.exists():
+                logger.info(f"Market funding file missing for {coin}; will fetch")
+                stale_coins.append(coin)
+                continue
+            try:
+                df = pd.read_parquet(fpath)
+                # Convert datetime column to tz-aware UTC
+                if "datetime" in df.columns:
+                    dt = pd.to_datetime(df["datetime"], utc=True)
+                    last_dt = dt.max()
+                    if last_dt < stale_cutoff:
+                        logger.info(
+                            f"Market funding file for {coin} is stale "
+                            f"(last: {last_dt}); will refresh"
+                        )
+                        stale_coins.append(coin)
+                    per_coin_df[coin] = df
+                else:
+                    logger.warning(f"File {fpath} has no 'datetime' column; refreshing")
+                    stale_coins.append(coin)
+            except Exception as e:
+                logger.warning(f"Failed reading {fpath}: {e}; will refresh")
+                stale_coins.append(coin)
+        
+        # Refresh stale coins using HyperliquidFundingManager
+        if stale_coins:
+            try:
+                from token_data.hyperliquid import HyperliquidFundingManager
+                
+                manager = HyperliquidFundingManager(
+                    ticker=stale_coins,
+                    data_dir=self.price_cache_dir,
+                    file_type="parquet",
+                    update=True,
+                    save=True,
+                    refresh_hours=24 * (stale_days + 1),
+                    info=self.monitor._info,
+                    verbose=False,
+                )
+                for coin in stale_coins:
+                    try:
+                        fresh = manager.get_data(coin)
+                        if fresh is not None and not fresh.empty:
+                            per_coin_df[coin] = fresh
+                    except Exception as e:
+                        logger.warning(f"Failed to refresh funding data for {coin}: {e}")
+            except Exception as e:
+                logger.warning(f"Failed to initialize HyperliquidFundingManager: {e}")
+        
+        # Combine into a single DataFrame with UTC DatetimeIndex
+        frames = []
+        for coin, df in per_coin_df.items():
+            if df is None or df.empty or "funding_rate" not in df.columns:
+                continue
+            sub = df[["datetime", "funding_rate"]].copy()
+            sub["datetime"] = pd.to_datetime(sub["datetime"], utc=True)
+            sub = sub.set_index("datetime")
+            sub["coin"] = coin
+            frames.append(sub)
+        
+        if not frames:
+            return pd.DataFrame(columns=["funding_rate", "coin"])
+        
+        combined = pd.concat(frames).sort_index()
+        return combined
+
     def _calculate_summary_stats(
         self,
         aum_data: pd.DataFrame,
@@ -869,33 +970,90 @@ class HyperliquidReporter(BaseReporter):
                     else:
                         daily_pnl_pct.append(0.0)
                 if len(daily_pnl_pct) > 1:
-                    daily_std = float(pd.Series(daily_pnl_pct).std())
+                    s = pd.Series(daily_pnl_pct)
+                    daily_std = float(s.std())
+                    daily_mean = float(s.mean())
                     stats["pnl_std_ann_pct"] = daily_std * math.sqrt(365)
+                    stats["pnl_mean_ann_pct"] = daily_mean * 365
                 else:
                     stats["pnl_std_ann_pct"] = 0.0
+                    stats["pnl_mean_ann_pct"] = 0.0
             else:
                 stats["pnl_std_ann_pct"] = 0.0
+                stats["pnl_mean_ann_pct"] = 0.0
         else:
             stats["pnl_std_ann_pct"] = 0.0
+            stats["pnl_mean_ann_pct"] = 0.0
         
-        # Annualized average funding rate over last 5, 10, 30 calendar days
-        # funding_rate is per-hour; annualize by * 24 * 365
-        if not funding_analysis.empty and "funding_rate" in funding_analysis.columns:
-            now = funding_analysis.index.max()
-            for days in [5, 10, 30]:
-                cutoff = now - pd.Timedelta(days=days)
-                window = funding_analysis[funding_analysis.index >= cutoff]["funding_rate"]
-                if len(window) > 0:
-                    avg_rate = float(window.mean())
-                    stats[f"avg_funding_rate_{days}d_ann_pct"] = avg_rate * 24 * 365 * 100
-                else:
-                    stats[f"avg_funding_rate_{days}d_ann_pct"] = 0.0
+        # Annualized average funding rate per coin over last 5, 10, 30 calendar days,
+        # computed from market-wide hourly funding rate files in
+        # {price_cache_dir}/funding/{coin}.parquet. Files that are more than
+        # 2 days old are refreshed to fill missing rows.
+        # funding_rate is per-hour; annualize by * 24 * 365, reported in %.
+        # Keys: funding_rate_{coin}_{days}d_ann_pct  (e.g. funding_rate_ETH_5d_ann_pct)
+        # Also stored: funding_rate_coins — ordered list of coin symbols with data
+        stats["funding_rate_coins"] = []
+        
+        # Determine which coins to use: coins the user has held per funding_analysis
+        if not funding_analysis.empty and "coin" in funding_analysis.columns:
+            coins_to_load = list(funding_analysis["coin"].unique())
         else:
-            for days in [5, 10, 30]:
-                stats[f"avg_funding_rate_{days}d_ann_pct"] = 0.0
+            coins_to_load = []
+        
+        if coins_to_load:
+            try:
+                market_rates = self._load_market_funding_rates(
+                    coins=coins_to_load, stale_days=2
+                )
+                if not market_rates.empty and "funding_rate" in market_rates.columns and "coin" in market_rates.columns:
+                    now_utc = pd.Timestamp.now(tz="UTC")
+                    coins_with_data = []
+                    for coin in coins_to_load:
+                        coin_rates = market_rates[market_rates["coin"] == coin]
+                        has_data = False
+                        for days in [5, 10, 30]:
+                            cutoff = now_utc - pd.Timedelta(days=days)
+                            window = coin_rates[coin_rates.index >= cutoff]["funding_rate"]
+                            if len(window) > 0:
+                                avg_rate = float(window.mean())
+                                stats[f"funding_rate_{coin}_{days}d_ann_pct"] = (
+                                    avg_rate * 24 * 365 * 100
+                                )
+                                has_data = True
+                            else:
+                                stats[f"funding_rate_{coin}_{days}d_ann_pct"] = 0.0
+                        if has_data:
+                            coins_with_data.append(coin)
+                    stats["funding_rate_coins"] = coins_with_data
+            except Exception as e:
+                logger.warning(f"Failed to compute market funding rate stats: {e}")
         
         return stats
     
+    def _render_funding_rate_cards(self, stats: dict) -> str:
+        """Render per-coin funding rate metric cards for the HTML account summary.
+        
+        Generates one card per coin per window (5d, 10d, 30d) using the keys
+        stored by _calculate_summary_stats: funding_rate_{coin}_{days}d_ann_pct.
+        """
+        coins = stats.get("funding_rate_coins", [])
+        if not coins:
+            return ""
+        cards = []
+        for coin in coins:
+            for days in [5, 10, 30]:
+                key = f"funding_rate_{coin}_{days}d_ann_pct"
+                value = stats.get(key, 0.0)
+                css = "positive" if value >= 0 else "negative"
+                sign = "+" if value >= 0 else ""
+                cards.append(
+                    f'<div class="metric-card {css}">'
+                    f'<div class="metric-label">{coin} Funding {days}d (Ann.)</div>'
+                    f'<div class="metric-value">{sign}{value:.2f}%</div>'
+                    f"</div>"
+                )
+        return "\n            ".join(cards)
+
     def create_visualizations(
         self,
         report_data: dict[str, Any],
@@ -1466,17 +1624,10 @@ class HyperliquidReporter(BaseReporter):
                 <div class="metric-label">Peak AUM</div>
                 <div class="metric-value">${stats.get('peak_aum', 0):,.2f}</div>
             </div>
-            <div class="metric-card">
-                <div class="metric-label">Avg Funding Rate 5d (Ann.)</div>
-                <div class="metric-value">{stats.get('avg_funding_rate_5d_ann_pct', 0):.2f}%</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Avg Funding Rate 10d (Ann.)</div>
-                <div class="metric-value">{stats.get('avg_funding_rate_10d_ann_pct', 0):.2f}%</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Avg Funding Rate 30d (Ann.)</div>
-                <div class="metric-value">{stats.get('avg_funding_rate_30d_ann_pct', 0):.2f}%</div>
+            {self._render_funding_rate_cards(stats)}
+            <div class="metric-card {'positive' if stats.get('pnl_mean_ann_pct', 0) >= 0 else 'negative'}">
+                <div class="metric-label">Avg Return (Ann.)</div>
+                <div class="metric-value">{'+'if stats.get('pnl_mean_ann_pct',0)>=0 else ''}{stats.get('pnl_mean_ann_pct', 0):.2f}%</div>
             </div>
             <div class="metric-card">
                 <div class="metric-label">P&L Std Dev (Ann.)</div>
@@ -1636,7 +1787,8 @@ class HyperliquidReporter(BaseReporter):
                 </thead>
                 <tbody>
 """
-                for _, wrow in weekly_perf.sort_index(ascending=False).iterrows():
+                # Show only last 4 weeks, newest first
+                for _, wrow in weekly_perf.tail(4).sort_index(ascending=False).iterrows():
                     w_pnl_class = "positive-value" if wrow["pnl_usd"] >= 0 else "negative-value"
                     w_pct_class = "positive-value" if wrow["pnl_pct"] >= 0 else "negative-value"
                     w_cum_class = "positive-value" if wrow["cumulative_pnl_usd"] >= 0 else "negative-value"
@@ -1659,11 +1811,15 @@ class HyperliquidReporter(BaseReporter):
     </div>
 """
 
-            # Add Performance from file section
+            # Add Performance from file section (last 30 days only)
             pnl_history = report_data.get("pnl_history", pd.DataFrame())
             if not pnl_history.empty:
-                # Create formatted data for display (don't modify original dataframe)
-                display_history = pnl_history.copy()
+                # Filter to last 30 days
+                cutoff_30d = pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=30)
+                display_history = pnl_history[pnl_history.index >= cutoff_30d].copy()
+            else:
+                display_history = pd.DataFrame()
+            if not display_history.empty:
                 display_history['aum_usd'] = display_history['aum_usd'].round(2)
                 display_history['net_deposits'] = display_history['net_deposits'].round(2)
                 display_history['pnl_pct'] = display_history['pnl_pct'].round(2)
@@ -1674,8 +1830,8 @@ class HyperliquidReporter(BaseReporter):
                 
                 html += f"""
     <div class="section">
-        <h3>📊 Performance from File</h3>
-        <p><strong>Historical P&L data from pnl_history.csv ({len(pnl_history)} entries)</strong></p>
+        <h3>📊 Performance from File (Last 30 Days)</h3>
+        <p><strong>Historical P&L data from pnl_history.csv ({len(display_history)} entries)</strong></p>
         <div style="overflow-x: auto;">
             <table>
                 <thead>
