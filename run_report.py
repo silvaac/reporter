@@ -21,6 +21,7 @@ from config import load_config
 from hyperliquid_reporter.monitoring import HyperliquidMonitor
 from hyperliquid_reporter.reporter import HyperliquidReporter
 from email_reporter import send_report_email
+from tc_analysis import generate_tc_analysis
 
 
 logging.basicConfig(
@@ -40,6 +41,9 @@ OUTPUT_DIR = "reports"
 PNL_HISTORY_FILE = "pnl_history.csv"
 PRICE_CACHE_DIR = "./data/hyperliquid"
 REPORT_FILENAME_TEMPLATE = "trading_report_{timestamp}.html"
+TRADES_CSV_PATH = "ringo_trades.csv"
+MARKET_PARQUET_PATH = "ETH-USD.parquet"
+TC_OUTPUT_DIR = "reports/tc"
 
 
 def main():
@@ -88,6 +92,16 @@ def main():
             output_dir=OUTPUT_DIR
         )
         
+        logger.info("Running TC analysis (trades=%s, market=%s)...",
+                    TRADES_CSV_PATH, MARKET_PARQUET_PATH)
+        tc_result = generate_tc_analysis(
+            trades_csv_path=TRADES_CSV_PATH,
+            market_parquet_path=MARKET_PARQUET_PATH,
+            output_dir=TC_OUTPUT_DIR,
+        )
+        logger.info("TC analysis status: %s", tc_result.get("status"))
+        report_data["tc_analysis"] = tc_result
+
         logger.info("Generating HTML report...")
         html_content = reporter.generate_html_report(
             report_data=report_data,

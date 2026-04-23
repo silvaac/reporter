@@ -1054,6 +1054,95 @@ class HyperliquidReporter(BaseReporter):
                 )
         return "\n            ".join(cards)
 
+    def _render_tc_section(self, tc: Optional[dict]) -> str:
+        """Render the Transaction Cost (TC) analysis section.
+
+        ``tc`` is the dict returned by ``tc_analysis.generate_tc_analysis``.
+        If ``tc`` is missing, or its status is not ``ok``, render a note and
+        move on without raising.
+        """
+        if not tc:
+            return """
+    <div class="section">
+        <h2>📐 TC Analysis</h2>
+        <p><em>TC analysis was not produced for this report.</em></p>
+    </div>
+"""
+
+        status = tc.get("status", "error")
+        if status != "ok":
+            msg = tc.get("message", "TC analysis unavailable.")
+            return f"""
+    <div class="section">
+        <h2>📐 TC Analysis</h2>
+        <p><em>{msg}</em></p>
+    </div>
+"""
+
+        parts: list[str] = []
+        parts.append("""
+    <div class="section">
+        <h2>📐 TC Analysis</h2>
+        <p>Transaction-cost / market-impact analysis produced by <code>analysis.run_analysis</code>.</p>
+""")
+
+        metrics_html = tc.get("metrics_html") or ""
+        if metrics_html:
+            parts.append(f"""
+        <h3>Summary Metrics</h3>
+        <div style="overflow-x: auto;">{metrics_html}</div>
+""")
+
+        impact_table_html = tc.get("impact_table_html") or ""
+        if impact_table_html:
+            parts.append(f"""
+        <h3>Market Impact Summary</h3>
+        <div style="overflow-x: auto;">{impact_table_html}</div>
+""")
+
+        summary_stats_html = tc.get("summary_stats_html") or ""
+        if summary_stats_html:
+            parts.append(f"""
+        <h3>Execution Summary Statistics</h3>
+        <div style="overflow-x: auto;">{summary_stats_html}</div>
+""")
+
+        plots = tc.get("plots", {}) or {}
+        plot_titles = {
+            "slippage": "Market Impact Over Time (vs Close & Mid)",
+            "impact_comparison": "Market Impact Comparison Over Time",
+            "pnl_vs_impact": "Scaled PnL vs Market Impact (vs Open)",
+            "raw_pnl_vs_impact": "Raw PnL Return vs Market Impact (vs Open)",
+        }
+        for key, title in plot_titles.items():
+            b64 = plots.get(key)
+            if b64:
+                parts.append(f"""
+        <h3>{title}</h3>
+        <div class="chart">
+            <img src="data:image/png;base64,{b64}" alt="{title}">
+        </div>
+""")
+
+        successful_preview_html = tc.get("successful_preview_html") or ""
+        if successful_preview_html:
+            parts.append(f"""
+        <h3>Successful Trades (last 10)</h3>
+        <div style="overflow-x: auto;">{successful_preview_html}</div>
+""")
+
+        joined_preview_html = tc.get("joined_preview_html") or ""
+        if joined_preview_html:
+            parts.append(f"""
+        <h3>Joined Trades + Market Data (last 10)</h3>
+        <div style="overflow-x: auto;">{joined_preview_html}</div>
+""")
+
+        parts.append("""
+    </div>
+""")
+        return "".join(parts)
+
     def create_visualizations(
         self,
         report_data: dict[str, Any],
@@ -2170,6 +2259,8 @@ class HyperliquidReporter(BaseReporter):
     </div>
 """
     
+            html += self._render_tc_section(report_data.get("tc_analysis"))
+
             html += """
     </div>
     
