@@ -10,7 +10,10 @@ def convert_datetime_columns(df: pd.DataFrame) -> pd.DataFrame:
     datetime_like_columns = [
         col
         for col in df.columns
-        if df[col].dtype == object and ("time" in col or "datetime" in col)
+        if (
+            not pd.api.types.is_datetime64_any_dtype(df[col])
+            and ("time" in col or "datetime" in col)
+        )
     ]
 
     df = df.copy()
