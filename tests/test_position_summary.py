@@ -222,8 +222,8 @@ class TestCalculateNetPositionMetrics:
         result = reporter._calculate_net_position_metrics(positions, None)
 
         assert result["net_position_usd"] == pytest.approx(0.0)
+        assert result["position_vol"] == pytest.approx(0.0)
         assert result["net_position_vol_usd"] == pytest.approx(0.0)
-        assert result["position_30d_vol"] == pytest.approx(0.0)
 
     def test_net_position_usd_correct(self, reporter):
         """net_position_usd = net_position * last_price."""
@@ -262,12 +262,12 @@ class TestCalculateNetPositionMetrics:
         prices = _make_price_series(60, last_price=3000.0, seed=7)
         result = reporter._calculate_net_position_metrics(positions, prices)
 
-        assert result["position_30d_vol"] > 0.0
-        # Annualised vol of a ~2% daily series is roughly 2% * sqrt(365) ≈ 38%
-        assert 0.01 < result["position_30d_vol"] < 5.0  # sanity bounds (as fraction)
+        assert result["position_vol"] > 0.0
+        # Per-hour vol of a ~2% daily series ≈ 2% / sqrt(24) ≈ 0.4% per hour
+        assert 0.0 < result["position_vol"] < 0.5  # sanity bounds (as fraction per hour)
 
     def test_vol_usd_equals_abs_position_times_price_times_vol(self, reporter):
-        """net_position_vol_usd = |net_position| * last_price * position_30d_vol."""
+        """net_position_vol_usd = |net_position| * last_price * position_vol."""
         positions = {
             "position_token": "ETH",
             "net_position": -3.0,
@@ -277,7 +277,7 @@ class TestCalculateNetPositionMetrics:
         prices = _make_price_series(60, last_price=2000.0, seed=99)
         result = reporter._calculate_net_position_metrics(positions, prices)
 
-        expected = abs(-3.0) * 2000.0 * result["position_30d_vol"]
+        expected = abs(-3.0) * 2000.0 * result["position_vol"]
         assert result["net_position_vol_usd"] == pytest.approx(expected, rel=1e-6)
 
     def test_empty_price_series_returns_zero_vol(self, reporter):
@@ -289,7 +289,7 @@ class TestCalculateNetPositionMetrics:
         }
         result = reporter._calculate_net_position_metrics(positions, pd.Series([], dtype=float))
 
-        assert result["position_30d_vol"] == pytest.approx(0.0)
+        assert result["position_vol"] == pytest.approx(0.0)
         assert result["net_position_vol_usd"] == pytest.approx(0.0)
 
     def test_insufficient_price_history_returns_zero_vol(self, reporter):
@@ -303,7 +303,7 @@ class TestCalculateNetPositionMetrics:
         prices = _make_price_series(1, last_price=3000.0)
         result = reporter._calculate_net_position_metrics(positions, prices)
 
-        assert result["position_30d_vol"] == pytest.approx(0.0)
+        assert result["position_vol"] == pytest.approx(0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -332,7 +332,7 @@ class TestSummaryStatsPositionFields:
             "position_token": "ETH",
             "last_perp_price": 3000.0,
             "net_position_usd": 3000.0,
-            "position_30d_vol": 0.40,
+            "position_vol": 0.40,
             "net_position_vol_usd": 1200.0,
         }
         base.update(overrides)
@@ -354,7 +354,7 @@ class TestSummaryStatsPositionFields:
         assert stats["position_token"] == "ETH"
         assert stats["last_perp_price"] == pytest.approx(3000.0)
         assert stats["net_position_usd"] == pytest.approx(3000.0)
-        assert stats["position_30d_vol"] == pytest.approx(0.40)
+        assert stats["position_vol"] == pytest.approx(0.40)
         assert stats["net_position_vol_usd"] == pytest.approx(1200.0)
 
     def test_position_fields_default_to_zero_when_absent(self, reporter):
@@ -382,7 +382,7 @@ class TestSummaryStatsPositionFields:
         assert stats["position_token"] is None
         assert stats["last_perp_price"] == pytest.approx(0.0)
         assert stats["net_position_usd"] == pytest.approx(0.0)
-        assert stats["position_30d_vol"] == pytest.approx(0.0)
+        assert stats["position_vol"] == pytest.approx(0.0)
         assert stats["net_position_vol_usd"] == pytest.approx(0.0)
 
     def test_no_spot_no_perp_all_zero(self, reporter):
@@ -394,7 +394,7 @@ class TestSummaryStatsPositionFields:
             position_token=None,
             last_perp_price=0.0,
             net_position_usd=0.0,
-            position_30d_vol=0.0,
+            position_vol=0.0,
             net_position_vol_usd=0.0,
         )
         stats = reporter._calculate_summary_stats(

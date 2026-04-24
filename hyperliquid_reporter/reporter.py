@@ -925,27 +925,28 @@ class HyperliquidReporter(BaseReporter):
         positions: dict[str, Any],
         price_series: Optional[pd.Series],
     ) -> dict[str, Any]:
-        """Calculate net-position USD exposure and 30-day price volatility.
+        """Calculate net-position USD exposure and per-period price volatility.
 
         Uses the last price in *price_series* for the USD conversion and computes
-        the 30-day annualised log-return volatility of that series.
+        the std of hourly log-returns over all available price data (no annualisation,
+        no window truncation).
 
         Assumption: spot and perp positions are for the same underlying token.
 
         Args:
             positions: dict with keys position_token, net_position, spot_position,
                 perp_position (as returned by get_positions_summary).
-            price_series: pandas Series of daily (or higher-frequency) close prices
-                with a DatetimeIndex.  The last value is used as the current price.
+            price_series: pandas Series of hourly close prices with a DatetimeIndex.
+                The last value is used as the current price.
                 Pass None or an empty Series if no price data is available.
 
         Returns:
             Dictionary with:
             - last_perp_price: float – most recent price in price_series (0 if unavailable)
             - net_position_usd: float – net_position * last_perp_price
-            - position_30d_vol: float – annualised 30-day log-return vol (as fraction,
-              e.g. 0.40 = 40%).  0.0 if < 2 data points are available.
-            - net_position_vol_usd: float – |net_position| * last_perp_price * position_30d_vol
+            - position_vol: float – std of hourly log-returns over all available data
+              (as fraction per hour, e.g. 0.002).  0.0 if < 2 data points available.
+            - net_position_vol_usd: float – |net_position| * last_perp_price * position_vol
         """
         net_position = float(positions.get("net_position", 0.0))
         position_token = positions.get("position_token")
@@ -953,7 +954,7 @@ class HyperliquidReporter(BaseReporter):
         zero_result: dict[str, Any] = {
             "last_perp_price": 0.0,
             "net_position_usd": 0.0,
-            "position_30d_vol": 0.0,
+            "position_vol": 0.0,
             "net_position_vol_usd": 0.0,
         }
 
@@ -965,33 +966,23 @@ class HyperliquidReporter(BaseReporter):
         if price_series is not None and len(price_series) > 0:
             last_price = float(price_series.iloc[-1])
 
-        # --- 30-day annualised log-return volatility ---
-        vol_30d = 0.0
+        # --- Per-period (hourly) log-return std over all available data ---
+        vol = 0.0
         if price_series is not None and len(price_series) >= 2:
-            # Use at most last 30 calendar-day data points
             try:
-                if hasattr(price_series.index, 'tz'):
-                    cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=30)
-                    window = price_series[price_series.index >= cutoff]
-                else:
-                    cutoff = pd.Timestamp.now() - pd.Timedelta(days=30)
-                    window = price_series[price_series.index >= cutoff]
-                if len(window) < 2:
-                    window = price_series
-                if len(window) >= 2:
-                    log_returns = (window / window.shift(1)).apply(math.log).dropna()
-                    if len(log_returns) >= 1:
-                        vol_30d = float(log_returns.std()) * math.sqrt(365)
+                log_returns = (price_series / price_series.shift(1)).apply(math.log).dropna()
+                if len(log_returns) >= 1:
+                    vol = float(log_returns.std())
             except Exception as e:
-                logger.warning("Failed to compute 30-day vol for %s: %s", position_token, e)
+                logger.warning("Failed to compute vol for %s: %s", position_token, e)
 
         net_position_usd = net_position * last_price
-        net_position_vol_usd = abs(net_position) * last_price * vol_30d
+        net_position_vol_usd = abs(net_position) * last_price * vol
 
         return {
             "last_perp_price": last_price,
             "net_position_usd": net_position_usd,
-            "position_30d_vol": vol_30d,
+            "position_vol": vol,
             "net_position_vol_usd": net_position_vol_usd,
         }
 
@@ -1095,7 +1086,7 @@ class HyperliquidReporter(BaseReporter):
         stats["position_token"] = account_summary.get("position_token", None)
         stats["last_perp_price"] = account_summary.get("last_perp_price", 0.0)
         stats["net_position_usd"] = account_summary.get("net_position_usd", 0.0)
-        stats["position_30d_vol"] = account_summary.get("position_30d_vol", 0.0)
+        stats["position_vol"] = account_summary.get("position_vol", 0.0)
         stats["net_position_vol_usd"] = account_summary.get("net_position_vol_usd", 0.0)
         
         # Annualized P&L std dev from pnl_history file
@@ -1190,7 +1181,7 @@ class HyperliquidReporter(BaseReporter):
         net = stats.get("net_position", 0.0)
         last_price = stats.get("last_perp_price", 0.0)
         net_usd = stats.get("net_position_usd", 0.0)
-        vol_30d = stats.get("position_30d_vol", 0.0)
+        vol_30d = stats.get("position_vol", 0.0)
         vol_usd = stats.get("net_position_vol_usd", 0.0)
 
         net_css = "positive" if net >= 0 else "negative"
@@ -1228,8 +1219,8 @@ class HyperliquidReporter(BaseReporter):
             f'</div>',
 
             f'<div class="metric-card">'
-            f'<div class="metric-label">30d Vol Ann. ({token})</div>'
-            f'<div class="metric-value">{vol_30d*100:.2f}%</div>'
+            f'<div class="metric-label">Vol per Hour ({token})</div>'
+            f'<div class="metric-value">{vol_30d*100:.4f}%</div>'
             f'</div>',
 
             f'<div class="metric-card">'
@@ -2537,7 +2528,7 @@ class HyperliquidReporter(BaseReporter):
             f"Net Position:       {account_summary.get('net_position', 0):,.4f}",
             f"Last Price:         ${account_summary.get('last_perp_price', 0):,.2f}",
             f"Net Position (USD): ${account_summary.get('net_position_usd', 0):,.2f}",
-            f"30d Vol (Ann.):     {account_summary.get('position_30d_vol', 0)*100:.2f}%",
+            f"Vol per Hour:       {account_summary.get('position_vol', 0)*100:.4f}%",
             f"Position Vol (USD): ${account_summary.get('net_position_vol_usd', 0):,.2f}",
             "",
             "=" * 70,
