@@ -337,9 +337,24 @@ class HyperliquidReporter(BaseReporter):
         # Use W-SAT: weeks end on Saturday (Sunday through Saturday grouping)
         grouped = perf_data_naive.groupby(perf_data_naive.index.to_period('W-SAT'))
         
+        prev_ending_aum = None
         for period, group in grouped:
-            starting_aum = float(group["aum_usd"].iloc[0])
             ending_aum = float(group["aum_usd"].iloc[-1])
+            # starting_aum is the AUM at end of last day of the previous week.
+            # group["aum_usd"].iloc[0] is already the closing AUM after the first day's
+            # P&L has been applied, so we must back it out using the first day's pnl_usd
+            # and the deposit change on that day. Equivalently, this equals the prior
+            # week's ending AUM. For the very first week, fall back to first day's AUM.
+            if prev_ending_aum is not None:
+                starting_aum = prev_ending_aum
+            else:
+                # First week: back out the first day's P&L from the first day's AUM
+                first_day_pnl = float(group["pnl_usd"].iloc[0])
+                first_day_deposit_change = float(group["net_deposits"].iloc[0]) - 0.0
+                starting_aum = float(group["aum_usd"].iloc[0]) - first_day_pnl - first_day_deposit_change
+                if starting_aum <= 0:
+                    starting_aum = float(group["aum_usd"].iloc[0])
+            prev_ending_aum = ending_aum
             week_pnl_usd = float(group["pnl_usd"].sum())
             
             if starting_aum > 0:
@@ -592,7 +607,17 @@ class HyperliquidReporter(BaseReporter):
             funding_analysis = self.generate_funding_analysis()
             
             account_summary = self.monitor.get_account_summary(lookback_days=3650)
-            
+
+            # Enrich account_summary with net-position USD and vol metrics.
+            # Assumption: spot and perp positions are for the same underlying token.
+            position_token = account_summary.get("position_token")
+            if position_token:
+                price_series = self._fetch_price_series(position_token)
+            else:
+                price_series = None
+            pos_metrics = self._calculate_net_position_metrics(account_summary, price_series)
+            account_summary.update(pos_metrics)
+
             # Save current P&L snapshot to history file
             current_aum = account_summary.get("current_value", 0.0)
             current_net_deposits = account_summary.get("net_deposits", 0.0)
@@ -860,6 +885,116 @@ class HyperliquidReporter(BaseReporter):
         combined = pd.concat(frames).sort_index()
         return combined
 
+    def _fetch_price_series(self, coin: str) -> Optional[pd.Series]:
+        """Fetch a close-price Series for *coin* using the local cache.
+
+        Returns a pd.Series with a UTC DatetimeIndex and close prices, or None
+        on failure.
+        """
+        try:
+            from token_data.hyperliquid import HyperliquidPerpManager
+
+            manager = HyperliquidPerpManager(
+                ticker=[coin],
+                data_dir=self.price_cache_dir,
+                interval="1h",
+                file_type="parquet",
+                update=True,
+                save=True,
+                refresh_hours=48,
+                info=self.monitor._info,
+                verbose=False,
+            )
+            price_data = manager.get_data(coin)
+            if price_data is None or price_data.empty:
+                return None
+            if "datetime" in price_data.columns:
+                price_df = price_data.set_index("datetime")["close"]
+            elif isinstance(price_data.index, pd.DatetimeIndex):
+                price_df = price_data["close"]
+            else:
+                return None
+            price_df.index = pd.to_datetime(price_df.index, utc=True)
+            return price_df.sort_index()
+        except Exception as e:
+            logger.warning("Failed to fetch price series for %s: %s", coin, e)
+            return None
+
+    def _calculate_net_position_metrics(
+        self,
+        positions: dict[str, Any],
+        price_series: Optional[pd.Series],
+    ) -> dict[str, Any]:
+        """Calculate net-position USD exposure and 30-day price volatility.
+
+        Uses the last price in *price_series* for the USD conversion and computes
+        the 30-day annualised log-return volatility of that series.
+
+        Assumption: spot and perp positions are for the same underlying token.
+
+        Args:
+            positions: dict with keys position_token, net_position, spot_position,
+                perp_position (as returned by get_positions_summary).
+            price_series: pandas Series of daily (or higher-frequency) close prices
+                with a DatetimeIndex.  The last value is used as the current price.
+                Pass None or an empty Series if no price data is available.
+
+        Returns:
+            Dictionary with:
+            - last_perp_price: float – most recent price in price_series (0 if unavailable)
+            - net_position_usd: float – net_position * last_perp_price
+            - position_30d_vol: float – annualised 30-day log-return vol (as fraction,
+              e.g. 0.40 = 40%).  0.0 if < 2 data points are available.
+            - net_position_vol_usd: float – |net_position| * last_perp_price * position_30d_vol
+        """
+        net_position = float(positions.get("net_position", 0.0))
+        position_token = positions.get("position_token")
+
+        zero_result: dict[str, Any] = {
+            "last_perp_price": 0.0,
+            "net_position_usd": 0.0,
+            "position_30d_vol": 0.0,
+            "net_position_vol_usd": 0.0,
+        }
+
+        if position_token is None:
+            return zero_result
+
+        # --- Last price ---
+        last_price = 0.0
+        if price_series is not None and len(price_series) > 0:
+            last_price = float(price_series.iloc[-1])
+
+        # --- 30-day annualised log-return volatility ---
+        vol_30d = 0.0
+        if price_series is not None and len(price_series) >= 2:
+            # Use at most last 30 calendar-day data points
+            try:
+                if hasattr(price_series.index, 'tz'):
+                    cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=30)
+                    window = price_series[price_series.index >= cutoff]
+                else:
+                    cutoff = pd.Timestamp.now() - pd.Timedelta(days=30)
+                    window = price_series[price_series.index >= cutoff]
+                if len(window) < 2:
+                    window = price_series
+                if len(window) >= 2:
+                    log_returns = (window / window.shift(1)).apply(math.log).dropna()
+                    if len(log_returns) >= 1:
+                        vol_30d = float(log_returns.std()) * math.sqrt(365)
+            except Exception as e:
+                logger.warning("Failed to compute 30-day vol for %s: %s", position_token, e)
+
+        net_position_usd = net_position * last_price
+        net_position_vol_usd = abs(net_position) * last_price * vol_30d
+
+        return {
+            "last_perp_price": last_price,
+            "net_position_usd": net_position_usd,
+            "position_30d_vol": vol_30d,
+            "net_position_vol_usd": net_position_vol_usd,
+        }
+
     def _calculate_summary_stats(
         self,
         aum_data: pd.DataFrame,
@@ -952,6 +1087,16 @@ class HyperliquidReporter(BaseReporter):
         stats["spot_value"] = account_summary.get("spot_value", 0.0)
         stats["perp_value"] = account_summary.get("perp_value", 0.0)
         stats["unrealized_pnl"] = account_summary.get("unrealized_pnl", 0.0)
+
+        # --- Position fields (spot + perp, assumed same token) ---
+        stats["spot_position"] = account_summary.get("spot_position", 0.0)
+        stats["perp_position"] = account_summary.get("perp_position", 0.0)
+        stats["net_position"] = account_summary.get("net_position", 0.0)
+        stats["position_token"] = account_summary.get("position_token", None)
+        stats["last_perp_price"] = account_summary.get("last_perp_price", 0.0)
+        stats["net_position_usd"] = account_summary.get("net_position_usd", 0.0)
+        stats["position_30d_vol"] = account_summary.get("position_30d_vol", 0.0)
+        stats["net_position_vol_usd"] = account_summary.get("net_position_vol_usd", 0.0)
         
         # Annualized P&L std dev from pnl_history file
         # Resample to daily (last snapshot per day) to avoid noise from
@@ -1030,6 +1175,70 @@ class HyperliquidReporter(BaseReporter):
         
         return stats
     
+    def _render_position_cards(self, stats: dict) -> str:
+        """Render position metric cards for the HTML account summary section.
+
+        Shows spot/perp/net positions, last price, net USD exposure, 30-day vol,
+        and position vol (USD).  Assumption noted: spot and perp are the same token.
+        """
+        token = stats.get("position_token")
+        if not token:
+            return ""
+
+        spot = stats.get("spot_position", 0.0)
+        perp = stats.get("perp_position", 0.0)
+        net = stats.get("net_position", 0.0)
+        last_price = stats.get("last_perp_price", 0.0)
+        net_usd = stats.get("net_position_usd", 0.0)
+        vol_30d = stats.get("position_30d_vol", 0.0)
+        vol_usd = stats.get("net_position_vol_usd", 0.0)
+
+        net_css = "positive" if net >= 0 else "negative"
+        net_usd_css = "positive" if net_usd >= 0 else "negative"
+
+        cards = [
+            f'<div class="metric-card">'
+            f'<div class="metric-label">Position Token <small style="font-size:0.7em;color:#888">(spot+perp assumed same)</small></div>'
+            f'<div class="metric-value">{token}</div>'
+            f'</div>',
+
+            f'<div class="metric-card">'
+            f'<div class="metric-label">Spot Position ({token})</div>'
+            f'<div class="metric-value">{spot:,.4f}</div>'
+            f'</div>',
+
+            f'<div class="metric-card">'
+            f'<div class="metric-label">Perp Position ({token})</div>'
+            f'<div class="metric-value">{perp:,.4f}</div>'
+            f'</div>',
+
+            f'<div class="metric-card {net_css}">'
+            f'<div class="metric-label">Net Position ({token})</div>'
+            f'<div class="metric-value">{net:,.4f}</div>'
+            f'</div>',
+
+            f'<div class="metric-card">'
+            f'<div class="metric-label">Last Perp Price ({token})</div>'
+            f'<div class="metric-value">${last_price:,.2f}</div>'
+            f'</div>',
+
+            f'<div class="metric-card {net_usd_css}">'
+            f'<div class="metric-label">Net Position (USD)</div>'
+            f'<div class="metric-value">${net_usd:,.2f}</div>'
+            f'</div>',
+
+            f'<div class="metric-card">'
+            f'<div class="metric-label">30d Vol Ann. ({token})</div>'
+            f'<div class="metric-value">{vol_30d*100:.2f}%</div>'
+            f'</div>',
+
+            f'<div class="metric-card">'
+            f'<div class="metric-label">Position Vol (USD, 1σ)</div>'
+            f'<div class="metric-value">${vol_usd:,.2f}</div>'
+            f'</div>',
+        ]
+        return "\n            ".join(cards)
+
     def _render_funding_rate_cards(self, stats: dict) -> str:
         """Render per-coin funding rate metric cards for the HTML account summary.
         
@@ -1713,6 +1922,7 @@ class HyperliquidReporter(BaseReporter):
                 <div class="metric-label">Peak AUM</div>
                 <div class="metric-value">${stats.get('peak_aum', 0):,.2f}</div>
             </div>
+            {self._render_position_cards(stats)}
             {self._render_funding_rate_cards(stats)}
             <div class="metric-card {'positive' if stats.get('pnl_mean_ann_pct', 0) >= 0 else 'negative'}">
                 <div class="metric-label">Avg Return (Ann.)</div>
@@ -2316,6 +2526,19 @@ class HyperliquidReporter(BaseReporter):
             "",
             f"Spot Value:         ${account_summary.get('spot_value', 0):,.2f}",
             f"Perpetual Value:    ${account_summary.get('perp_value', 0):,.2f}",
+            "",
+            "=" * 70,
+            "CURRENT POSITION  (spot + perp assumed same token)",
+            "=" * 70,
+            "",
+            f"Token:              {account_summary.get('position_token') or 'None'}",
+            f"Spot Position:      {account_summary.get('spot_position', 0):,.4f}",
+            f"Perp Position:      {account_summary.get('perp_position', 0):,.4f}",
+            f"Net Position:       {account_summary.get('net_position', 0):,.4f}",
+            f"Last Price:         ${account_summary.get('last_perp_price', 0):,.2f}",
+            f"Net Position (USD): ${account_summary.get('net_position_usd', 0):,.2f}",
+            f"30d Vol (Ann.):     {account_summary.get('position_30d_vol', 0)*100:.2f}%",
+            f"Position Vol (USD): ${account_summary.get('net_position_vol_usd', 0):,.2f}",
             "",
             "=" * 70,
             "TRADING ACTIVITY",

@@ -471,6 +471,63 @@ class HyperliquidMonitor(PortfolioMonitor):
         except Exception as e:
             raise ExchangeError(f"Failed to fetch funding history: {e}") from e
     
+    def get_positions_summary(self) -> dict[str, Any]:
+        """Get current signed positions for both spot and perpetual accounts.
+
+        Assumption: if both a spot and a perp position exist, they are assumed
+        to be for the same underlying token.  The net position is simply the
+        sum of the spot token balance and the signed perp position size.
+
+        Returns:
+            Dictionary containing:
+            - position_token: Symbol of the non-USDC token (str or None)
+            - spot_position: Signed token quantity held in the spot account (float)
+            - perp_position: Signed notional size of the perp position (float)
+            - net_position: spot_position + perp_position (float)
+
+        Note:
+            All values default to 0.0 / None if the underlying API call fails.
+        """
+        position_token: Optional[str] = None
+        perp_position: float = 0.0
+        spot_position: float = 0.0
+
+        # --- Perpetual position ---
+        try:
+            user_state = self._info.user_state(self._address)
+            for pos_data in user_state.get("assetPositions", []):
+                pos = pos_data.get("position", {})
+                szi = float(pos.get("szi", 0.0))
+                if szi != 0.0:
+                    perp_position = szi
+                    position_token = pos.get("coin")
+                    break
+        except Exception as e:
+            logger.warning("Failed to fetch perp position: %s", e)
+
+        # --- Spot position (ignore USDC balances) ---
+        try:
+            spot_state = self._info.spot_user_state(self._address)
+            for balance in spot_state.get("balances", []):
+                coin = balance.get("coin", "")
+                if coin == "USDC":
+                    continue
+                total = float(balance.get("total", 0.0))
+                if total != 0.0:
+                    spot_position = total
+                    if position_token is None:
+                        position_token = coin
+                    break
+        except Exception as e:
+            logger.warning("Failed to fetch spot position: %s", e)
+
+        return {
+            "position_token": position_token,
+            "spot_position": spot_position,
+            "perp_position": perp_position,
+            "net_position": spot_position + perp_position,
+        }
+
     def get_account_summary(
         self,
         lookback_days: int = 3650,
@@ -661,6 +718,21 @@ class HyperliquidMonitor(PortfolioMonitor):
 
             return summary
 
+        def _enrich_with_positions(summary_dict: dict[str, Any]) -> dict[str, Any]:
+            """Merge get_positions_summary fields into an account summary dict."""
+            try:
+                pos = self.get_positions_summary()
+            except Exception as e:
+                logger.warning("Failed to enrich account summary with positions: %s", e)
+                pos = {
+                    "position_token": None,
+                    "spot_position": 0.0,
+                    "perp_position": 0.0,
+                    "net_position": 0.0,
+                }
+            summary_dict.update(pos)
+            return summary_dict
+
         try:
             from token_data.hyper_account import get_account_summary as td_get_account_summary
 
@@ -673,26 +745,26 @@ class HyperliquidMonitor(PortfolioMonitor):
             if isinstance(result, tuple):
                 # Expected historical behavior: (summary_dict, details)
                 if len(result) >= 1 and isinstance(result[0], dict):
-                    return result[0]
+                    return _enrich_with_positions(result[0])
                 raise TypeError("Unexpected tuple return from token_data.get_account_summary")
 
             if isinstance(result, dict):
                 # Some versions may return only the summary dict
-                return result
+                return _enrich_with_positions(result)
 
             # Some buggy versions return None after printing errors.
             raise TypeError("token_data.get_account_summary returned None")
 
         except ImportError:
-            return _fallback_summary()
+            return _enrich_with_positions(_fallback_summary())
         except NameError:
             # Some token_data versions reference helper functions that may not exist
             # depending on optional data feeds (e.g. spot tickers). Do not fail hard.
-            return _fallback_summary()
+            return _enrich_with_positions(_fallback_summary())
         except Exception:
             logger.exception("token_data account summary failed; falling back to Info-based summary")
             try:
-                return _fallback_summary()
+                return _enrich_with_positions(_fallback_summary())
             except Exception as e:
                 raise ExchangeError(f"Failed to fetch account summary: {e}") from e
     
