@@ -219,3 +219,4 @@ pnl_history.csv
 *.parquet
 # data directory
 data
+pnl_history.csv.backup

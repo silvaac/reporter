@@ -1609,6 +1609,11 @@ class HyperliquidReporter(BaseReporter):
                 spot_price = float(spot_series.iloc[-1])
 
         # Create new row with all columns
+        new_columns = [
+            'datetime', 'aum_usd', 'net_deposits',
+            'spot_position', 'perp_position',
+            'spot_price', 'perp_price', 'funding_usd',
+        ]
         new_row = pd.DataFrame({
             'datetime': [current_time],
             'aum_usd': [aum_usd],
@@ -1620,9 +1625,30 @@ class HyperliquidReporter(BaseReporter):
             'funding_usd': [daily_funding_usd],
         })
 
-        # Append to file or create new file
+        # Check for schema migration: if existing file has old schema, rewrite with new
         if history_file.exists():
-            new_row.to_csv(history_file, mode='a', header=False, index=False)
+            try:
+                existing = pd.read_csv(history_file)
+                missing_cols = [c for c in new_columns if c not in existing.columns]
+                if missing_cols:
+                    # Old schema - migrate by padding missing columns with 0.0
+                    logger.info(
+                        "Migrating pnl_history.csv: adding columns %s", missing_cols
+                    )
+                    for col in missing_cols:
+                        existing[col] = 0.0
+                    # Ensure column order is consistent
+                    existing = existing[new_columns]
+                    # Rewrite full file with new header, then append new row below
+                    existing.to_csv(history_file, mode='w', header=True, index=False)
+                    new_row.to_csv(history_file, mode='a', header=False, index=False)
+                else:
+                    # Schema matches - simple append
+                    new_row.to_csv(history_file, mode='a', header=False, index=False)
+            except Exception as e:
+                logger.warning(f"Error during pnl_history write/migration: {e}")
+                # Fallback: plain append (may create malformed rows, but logged)
+                new_row.to_csv(history_file, mode='a', header=False, index=False)
         else:
             new_row.to_csv(history_file, mode='w', header=True, index=False)
 
