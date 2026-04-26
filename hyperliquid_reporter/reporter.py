@@ -618,14 +618,27 @@ class HyperliquidReporter(BaseReporter):
             pos_metrics = self._calculate_net_position_metrics(account_summary, price_series)
             account_summary.update(pos_metrics)
 
-            # Save current P&L snapshot to history file
+            # Generate funding summaries before saving P&L (need daily funding for snapshot)
+            weekly_performance = self.generate_weekly_performance(performance_data)
+            daily_funding = self.generate_daily_funding(funding_analysis)
+            weekly_funding = self.generate_weekly_funding(funding_analysis)
+
+            # Get today's funding total for the snapshot
+            today = pd.Timestamp.now(tz='UTC').normalize()
+            today_funding = 0.0
+            if not daily_funding.empty and 'date' in daily_funding.columns:
+                today_row = daily_funding[daily_funding['date'] == today]
+                if not today_row.empty and 'total_funding_usd' in today_row.columns:
+                    today_funding = float(today_row['total_funding_usd'].iloc[0])
+
+            # Save current P&L snapshot to history file (with funding and positions)
             current_aum = account_summary.get("current_value", 0.0)
             current_net_deposits = account_summary.get("net_deposits", 0.0)
-            self._save_pnl_history(current_aum, current_net_deposits)
-            
-            # Load P&L history from file
+            self._save_pnl_history(current_aum, current_net_deposits, today_funding)
+
+            # Load P&L history from file (includes newly saved row with exposure_pnl calc)
             pnl_history = self._load_pnl_history()
-            
+
             summary_stats = self._calculate_summary_stats(
                 aum_data=aum_data,
                 performance_data=performance_data,
@@ -634,10 +647,6 @@ class HyperliquidReporter(BaseReporter):
                 account_summary=account_summary,
                 pnl_history=pnl_history,
             )
-            
-            weekly_performance = self.generate_weekly_performance(performance_data)
-            daily_funding = self.generate_daily_funding(funding_analysis)
-            weekly_funding = self.generate_weekly_funding(funding_analysis)
             
             return {
                 "aum_data": aum_data,
@@ -918,6 +927,54 @@ class HyperliquidReporter(BaseReporter):
             return price_df.sort_index()
         except Exception as e:
             logger.warning("Failed to fetch price series for %s: %s", coin, e)
+            return None
+
+    def _fetch_spot_price_series(self, coin: str) -> Optional[pd.Series]:
+        """Fetch a spot close-price Series for *coin* using the local cache.
+
+        Reads from local parquet cache files in the 'spot' subfolder.
+        Spot prices are stored separately from perp prices.
+        File naming pattern: {coin}_USDC_1h.parquet
+
+        Returns a pd.Series with a UTC DatetimeIndex and close prices, or None
+        on failure.
+        """
+        try:
+            from pathlib import Path
+
+            # Use spot subfolder within price_cache_dir
+            spot_cache_dir = Path(self.price_cache_dir) / "spot"
+            spot_cache_dir.mkdir(parents=True, exist_ok=True)
+
+            # File naming pattern: ETH_USDC_1h.parquet
+            file_path = spot_cache_dir / f"{coin}_USDC_1h.parquet"
+
+            if not file_path.exists():
+                logger.warning("Spot price file not found: %s", file_path)
+                return None
+
+            # Read parquet file - use fastparquet if available (handles older parquet versions)
+            try:
+                price_data = pd.read_parquet(file_path, engine="fastparquet")
+            except Exception:
+                # Fall back to pyarrow if fastparquet fails
+                price_data = pd.read_parquet(file_path, engine="pyarrow")
+
+            if price_data is None or price_data.empty:
+                return None
+
+            # Extract close prices with datetime index
+            if "datetime" in price_data.columns:
+                price_df = price_data.set_index("datetime")["close"]
+            elif isinstance(price_data.index, pd.DatetimeIndex):
+                price_df = price_data["close"]
+            else:
+                return None
+
+            price_df.index = pd.to_datetime(price_df.index, utc=True)
+            return price_df.sort_index()
+        except Exception as e:
+            logger.warning("Failed to fetch spot price series for %s: %s", coin, e)
             return None
 
     def _calculate_net_position_metrics(
@@ -1479,25 +1536,31 @@ class HyperliquidReporter(BaseReporter):
         
         return self._fig_to_base64(fig)
     
-    def _save_pnl_history(self, aum_usd: float, net_deposits: float) -> None:
-        """Save current P&L snapshot to history file.
-        
+    def _save_pnl_history(
+        self,
+        aum_usd: float,
+        net_deposits: float,
+        daily_funding_usd: float = 0.0,
+    ) -> None:
+        """Save current P&L snapshot to history file with position and price data.
+
         If net_deposits is 0 but the previous snapshot had deposits > 0,
         the last known net_deposits value is carried forward to prevent
         phantom P&L from erroneous zero values (e.g. ledger fetch failure).
-        
+
         Args:
             aum_usd: Current assets under management.
             net_deposits: Current net deposits.
+            daily_funding_usd: Daily cumulative funding paid/received in USD.
         """
         from pathlib import Path
-        
+
         history_file = Path(self.pnl_history_file)
         current_time = pd.Timestamp.now(tz='UTC')
-        
+
         # Create parent directories if they don't exist
         history_file.parent.mkdir(parents=True, exist_ok=True)
-        
+
         # Carry forward last known net_deposits if new value is 0 but previous was > 0
         if net_deposits == 0.0 and history_file.exists():
             try:
@@ -1512,20 +1575,57 @@ class HyperliquidReporter(BaseReporter):
                         net_deposits = last_net_deposits
             except Exception as e:
                 logger.warning(f"Could not read previous net_deposits for carry-forward: {e}")
-        
-        # Create new row
+
+        # Fetch position data and prices
+        spot_position = 0.0
+        perp_position = 0.0
+        spot_price = 0.0
+        perp_price = 0.0
+        position_token = None
+
+        try:
+            positions = self.monitor.get_positions_summary()
+            # Validate positions is a dict and extract numeric values
+            if isinstance(positions, dict):
+                spot_pos = positions.get("spot_position", 0.0)
+                perp_pos = positions.get("perp_position", 0.0)
+                token = positions.get("position_token")
+                # Ensure numeric types (defensive against mocks returning non-numeric)
+                spot_position = float(spot_pos) if spot_pos is not None else 0.0
+                perp_position = float(perp_pos) if perp_pos is not None else 0.0
+                position_token = token if isinstance(token, str) else None
+        except Exception as e:
+            logger.warning(f"Could not fetch positions for pnl_history: {e}")
+
+        if position_token:
+            # Fetch perp price (already cached from funding analysis)
+            perp_series = self._fetch_price_series(position_token)
+            if perp_series is not None and len(perp_series) > 0:
+                perp_price = float(perp_series.iloc[-1])
+
+            # Fetch spot price (may require new download to spot cache)
+            spot_series = self._fetch_spot_price_series(position_token)
+            if spot_series is not None and len(spot_series) > 0:
+                spot_price = float(spot_series.iloc[-1])
+
+        # Create new row with all columns
         new_row = pd.DataFrame({
             'datetime': [current_time],
             'aum_usd': [aum_usd],
-            'net_deposits': [net_deposits]
+            'net_deposits': [net_deposits],
+            'spot_position': [spot_position],
+            'perp_position': [perp_position],
+            'spot_price': [spot_price],
+            'perp_price': [perp_price],
+            'funding_usd': [daily_funding_usd],
         })
-        
+
         # Append to file or create new file
         if history_file.exists():
             new_row.to_csv(history_file, mode='a', header=False, index=False)
         else:
             new_row.to_csv(history_file, mode='w', header=True, index=False)
-        
+
         logger.info(f"Saved P&L snapshot to {history_file}")
     
     def _load_pnl_history(self) -> pd.DataFrame:
@@ -1569,7 +1669,34 @@ class HyperliquidReporter(BaseReporter):
                     if df["aum_usd"].iloc[i-1] > 0:
                         period_pct = (period_pnl / df["aum_usd"].iloc[i-1]) * 100
                         df.iloc[i, df.columns.get_loc("pnl_pct")] = period_pct
-            
+
+            # Calculate exposure P&L: day-over-day change in position value
+            # Position value = (perp_position × perp_price) + (spot_position × spot_price)
+            df["exposure_pnl"] = 0.0
+
+            # Check if position columns exist (backward compatibility with old CSV)
+            has_position_data = all(
+                col in df.columns
+                for col in ["spot_position", "perp_position", "spot_price", "perp_price"]
+            )
+
+            if has_position_data and len(df) > 1:
+                # Calculate position value for each row
+                df["position_value"] = (
+                    df["perp_position"] * df["perp_price"]
+                    + df["spot_position"] * df["spot_price"]
+                )
+
+                # Calculate exposure P&L as day-over-day difference
+                for i in range(1, len(df)):
+                    exposure_pnl = (
+                        df["position_value"].iloc[i] - df["position_value"].iloc[i - 1]
+                    )
+                    df.iloc[i, df.columns.get_loc("exposure_pnl")] = exposure_pnl
+
+                # Drop temporary calculation column
+                df = df.drop(columns=["position_value"])
+
             logger.info(f"Loaded P&L history with {len(df)} entries from {history_file}")
             return df
             
@@ -2130,6 +2257,10 @@ class HyperliquidReporter(BaseReporter):
                         <th>Date (EST)</th>
                         <th>AUM (USD)</th>
                         <th>Net Deposits (USD)</th>
+                        <th>Spot Price</th>
+                        <th>Perp Price</th>
+                        <th>Funding ($)</th>
+                        <th>Exposure P&L ($)</th>
                         <th>P&L (USD)</th>
                         <th>P&L (%)</th>
                         <th>Cumulative P&L (USD)</th>
@@ -2145,16 +2276,29 @@ class HyperliquidReporter(BaseReporter):
                     pnl_pct_class = "positive-value" if row["pnl_pct"] >= 0 else "negative-value"
                     cum_pnl_class = "positive-value" if row["cumulative_pnl_usd"] >= 0 else "negative-value"
                     cum_pct_class = "positive-value" if row["cumulative_pnl_pct"] >= 0 else "negative-value"
-                    
+
+                    # Handle new columns with backward compatibility (may not exist in old rows)
+                    spot_price = row.get('spot_price', 0.0)
+                    perp_price = row.get('perp_price', 0.0)
+                    funding_usd = row.get('funding_usd', 0.0)
+                    exposure_pnl = row.get('exposure_pnl', 0.0)
+
+                    funding_class = "positive-value" if funding_usd >= 0 else "negative-value"
+                    exposure_class = "positive-value" if exposure_pnl >= 0 else "negative-value"
+
                     # Convert UTC to US/Eastern (handles EST/EDT automatically)
                     est_time = to_eastern(idx)
-                    
+
                     html += f"""
                     <tr>
                         <td>{idx.strftime('%Y-%m-%d %H:%M')}</td>
                         <td>{est_time.strftime('%Y-%m-%d %H:%M')}</td>
                         <td>${row['aum_usd']:,.2f}</td>
                         <td>${row['net_deposits']:,.2f}</td>
+                        <td>${spot_price:,.2f}</td>
+                        <td>${perp_price:,.2f}</td>
+                        <td class="{funding_class}">${funding_usd:,.2f}</td>
+                        <td class="{exposure_class}">${exposure_pnl:,.2f}</td>
                         <td class="{pnl_class}">${row['pnl_usd']:,.2f}</td>
                         <td class="{pnl_pct_class}">{row['pnl_pct']:,.2f}</td>
                         <td class="{cum_pnl_class}">${row['cumulative_pnl_usd']:,.2f}</td>
