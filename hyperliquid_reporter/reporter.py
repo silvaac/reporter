@@ -1696,8 +1696,11 @@ class HyperliquidReporter(BaseReporter):
                         period_pct = (period_pnl / df["aum_usd"].iloc[i-1]) * 100
                         df.iloc[i, df.columns.get_loc("pnl_pct")] = period_pct
 
-            # Calculate exposure P&L: day-over-day change in position value
-            # Position value = (perp_position × perp_price) + (spot_position × spot_price)
+            # Calculate exposure P&L: price-driven change in position value.
+            # Uses the PRIOR position (held during the price move) so that
+            # position-size changes between snapshots do not create phantom P&L.
+            #   exposure_pnl[t] = perp_position[t-1] * (perp_price[t] - perp_price[t-1])
+            #                   + spot_position[t-1] * (spot_price[t] - spot_price[t-1])
             df["exposure_pnl"] = 0.0
 
             # Check if position columns exist (backward compatibility with old CSV)
@@ -1707,21 +1710,24 @@ class HyperliquidReporter(BaseReporter):
             )
 
             if has_position_data and len(df) > 1:
-                # Calculate position value for each row
-                df["position_value"] = (
-                    df["perp_position"] * df["perp_price"]
-                    + df["spot_position"] * df["spot_price"]
-                )
-
-                # Calculate exposure P&L as day-over-day difference
                 for i in range(1, len(df)):
+                    perp_price_diff = (
+                        df["perp_price"].iloc[i] - df["perp_price"].iloc[i - 1]
+                    )
+                    spot_price_diff = (
+                        df["spot_price"].iloc[i] - df["spot_price"].iloc[i - 1]
+                    )
+                    # Skip rows where prior price is missing (zero) -- e.g. migrated
+                    # legacy rows that have no position/price data.
+                    prior_perp_price = df["perp_price"].iloc[i - 1]
+                    prior_spot_price = df["spot_price"].iloc[i - 1]
+                    if prior_perp_price == 0.0 and prior_spot_price == 0.0:
+                        continue
                     exposure_pnl = (
-                        df["position_value"].iloc[i] - df["position_value"].iloc[i - 1]
+                        df["perp_position"].iloc[i - 1] * perp_price_diff
+                        + df["spot_position"].iloc[i - 1] * spot_price_diff
                     )
                     df.iloc[i, df.columns.get_loc("exposure_pnl")] = exposure_pnl
-
-                # Drop temporary calculation column
-                df = df.drop(columns=["position_value"])
 
             logger.info(f"Loaded P&L history with {len(df)} entries from {history_file}")
             return df
@@ -2273,7 +2279,7 @@ class HyperliquidReporter(BaseReporter):
                 
                 html += f"""
     <div class="section">
-        <h3>📊 Performance from File (Last 30 Days)</h3>
+        <h3>📊 Daily P&L Attribution (Last 30 Days)</h3>
         <p><strong>Historical P&L data from pnl_history.csv ({len(display_history)} entries)</strong></p>
         <div style="overflow-x: auto;">
             <table>
@@ -2285,7 +2291,7 @@ class HyperliquidReporter(BaseReporter):
                         <th>Net Deposits (USD)</th>
                         <th>Spot Price</th>
                         <th>Perp Price</th>
-                        <th>Funding ($)</th>
+                        <th>Funding (¢)</th>
                         <th>Exposure P&L ($)</th>
                         <th>P&L (USD)</th>
                         <th>P&L (%)</th>
@@ -2323,7 +2329,7 @@ class HyperliquidReporter(BaseReporter):
                         <td>${row['net_deposits']:,.2f}</td>
                         <td>${spot_price:,.2f}</td>
                         <td>${perp_price:,.2f}</td>
-                        <td class="{funding_class}">${funding_usd:,.2f}</td>
+                        <td class="{funding_class}">{funding_usd * 100:,.4f}¢</td>
                         <td class="{exposure_class}">${exposure_pnl:,.2f}</td>
                         <td class="{pnl_class}">${row['pnl_usd']:,.2f}</td>
                         <td class="{pnl_pct_class}">{row['pnl_pct']:,.2f}</td>
