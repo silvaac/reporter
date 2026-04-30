@@ -623,13 +623,28 @@ class HyperliquidReporter(BaseReporter):
             daily_funding = self.generate_daily_funding(funding_analysis)
             weekly_funding = self.generate_weekly_funding(funding_analysis)
 
-            # Get today's funding total for the snapshot
-            today = pd.Timestamp.now(tz='UTC').normalize()
+            # Get today's cumulative funding total for the snapshot.
+            # daily_funding['date'] is tz-naive (stripped in generate_daily_funding),
+            # so we must strip tz from 'today' to match.
+            today_utc = pd.Timestamp.now(tz='UTC').normalize().tz_localize(None)
             today_funding = 0.0
             if not daily_funding.empty and 'date' in daily_funding.columns:
-                today_row = daily_funding[daily_funding['date'] == today]
-                if not today_row.empty and 'total_funding_usd' in today_row.columns:
-                    today_funding = float(today_row['total_funding_usd'].iloc[0])
+                # Normalize daily_funding dates for robust comparison
+                funding_dates = pd.to_datetime(daily_funding['date']).dt.normalize()
+                mask = funding_dates == today_utc
+                if mask.any() and 'total_funding_usd' in daily_funding.columns:
+                    today_funding = float(
+                        daily_funding.loc[mask, 'total_funding_usd'].sum()
+                    )
+                    logger.info(
+                        "Today's (%s UTC) cumulative funding: $%.4f",
+                        today_utc.date(), today_funding,
+                    )
+                else:
+                    logger.info(
+                        "No funding entries for today (%s UTC); funding=$0.00",
+                        today_utc.date(),
+                    )
 
             # Save current P&L snapshot to history file (with funding and positions)
             current_aum = account_summary.get("current_value", 0.0)
