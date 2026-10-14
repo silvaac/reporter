@@ -34,45 +34,49 @@ def send_report_email(to, subject, summary_text, html_content, attachment_filena
         print("Error: MAILGUN_API_KEY or MAILGUN_DOMAIN not set in .env file")
         return 1
     
-    try:
-        # Mailgun API endpoint
-        url = f"https://api.mailgun.net/v3/{domain}/messages"
-        
-        # Prepare email data
-        recipients = [to] if isinstance(to, str) else list(to)
-        email_data = {
-            "from": f"Trading Reporter <{from_email}>",
-            "to": recipients,
-            "subject": subject,
-            "text": summary_text
-        }
-        
-        # Prepare HTML attachment
-        files = [
-            ("attachment", (attachment_filename, html_content.encode('utf-8'), "text/html"))
-        ]
-        
-        # Send the email
-        response = requests.post(
-            url,
-            auth=("api", api_key),
-            data=email_data,
-            files=files
-        )
-        
-        # Check response
-        if response.status_code == 200:
-            print(f"✓ Email sent successfully!")
-            print(f"  To: {', '.join(recipients)}")
-            print(f"  Subject: {subject}")
-            print(f"  Attachment: {attachment_filename}")
-            print(f"  Message ID: {response.json().get('id')}")
-            return 0
-        else:
-            print(f"✗ Error: {response.status_code}")
-            print(f"  Response: {response.text}")
-            return 1
-            
-    except Exception as e:
-        print(f"✗ Error sending email: {e}")
-        return 1
+    # Mailgun API endpoint
+    url = f"https://api.mailgun.net/v3/{domain}/messages"
+    recipients = [to] if isinstance(to, str) else list(to)
+    encoded_html = html_content.encode('utf-8')
+    overall_result = 0
+
+    for recipient in recipients:
+        try:
+            # Prepare email data
+            email_data = {
+                "from": f"Trading Reporter <{from_email}>",
+                "to": [recipient],
+                "subject": subject,
+                "text": summary_text
+            }
+
+            # Prepare HTML attachment
+            files = [
+                ("attachment", (attachment_filename, encoded_html, "text/html"))
+            ]
+
+            # Send the email
+            response = requests.post(
+                url,
+                auth=("api", api_key),
+                data=email_data,
+                files=files
+            )
+
+            # Check response
+            if response.status_code == 200:
+                print(f"✓ Email sent successfully!")
+                print(f"  To: {recipient}")
+                print(f"  Subject: {subject}")
+                print(f"  Attachment: {attachment_filename}")
+                print(f"  Message ID: {response.json().get('id')}")
+            else:
+                print(f"✗ Error sending to {recipient}: {response.status_code}")
+                print(f"  Response: {response.text}")
+                overall_result = 1
+
+        except Exception as e:
+            print(f"✗ Error sending email to {recipient}: {e}")
+            overall_result = 1
+
+    return overall_result
