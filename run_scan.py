@@ -38,7 +38,7 @@ RETURN_DAYS = 30               # window for perp return
 VOLUME_DAYS = 30               # window for volume median
 HOURS_PER_YEAR = 24 * 365      # annualisation factor for hourly data
 
-EMAIL_TO = "silvaac@yahoo.com"
+EMAIL_TO = ["silvaac@yahoo.com"]
 EMAIL_SUBJECT_TEMPLATE = "Market Scan - {date}"
 OUTPUT_DIR = "reports"
 

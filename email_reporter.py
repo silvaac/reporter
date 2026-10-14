@@ -15,7 +15,7 @@ def send_report_email(to, subject, summary_text, html_content, attachment_filena
     Send trading report email with HTML attachment and text summary.
     
     Args:
-        to: Recipient email address
+        to: Recipient email address(es) (str or list of str)
         subject: Email subject line
         summary_text: Plain text summary for email body
         html_content: Full HTML report content to attach
@@ -39,9 +39,10 @@ def send_report_email(to, subject, summary_text, html_content, attachment_filena
         url = f"https://api.mailgun.net/v3/{domain}/messages"
         
         # Prepare email data
+        recipients = [to] if isinstance(to, str) else list(to)
         email_data = {
             "from": f"Trading Reporter <{from_email}>",
-            "to": [to],
+            "to": recipients,
             "subject": subject,
             "text": summary_text
         }
@@ -62,7 +63,7 @@ def send_report_email(to, subject, summary_text, html_content, attachment_filena
         # Check response
         if response.status_code == 200:
             print(f"✓ Email sent successfully!")
-            print(f"  To: {to}")
+            print(f"  To: {', '.join(recipients)}")
             print(f"  Subject: {subject}")
             print(f"  Attachment: {attachment_filename}")
             print(f"  Message ID: {response.json().get('id')}")
